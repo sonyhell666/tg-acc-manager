@@ -157,9 +157,28 @@ def account_issue_from_error(error):
         return 'banned'
     if any(marker in description for marker in ('AUTHKEYUNREGISTEREDERROR','AUTHKEYINVALIDERROR','SESSIONREVOKEDERROR')):
         return 'invalid'
-    if any(marker in description for marker in ('PEERFLOODERROR','USERRESTRICTEDERROR','ACCOUNTRESTRICTEDERROR','ACCOUNTRESTRICTED:')):
+    if any(marker in description for marker in ('PEERFLOODERROR','PEERFLOOD','USERRESTRICTEDERROR','ACCOUNTRESTRICTEDERROR','ACCOUNTRESTRICTED:')):
         return 'restricted'
     return ''
+
+def spam_restriction_notice(error):
+    description=re.sub(r'[^A-Z0-9:]', '', f'{type(error).__name__}: {error}'.upper())
+    if any(marker in description for marker in ('PEERFLOODERROR','PEERFLOOD','USERRESTRICTEDERROR','ACCOUNTRESTRICTEDERROR','ACCOUNTRESTRICTED:')):
+        return (
+            'Telegram отклонил отправку из-за ограничения аккаунта, связанного со спамом. '
+            'Приложение пометило аккаунт как ограниченный. Проверьте статус и возможный срок ограничения '
+            'в официальном боте Telegram @SpamBot; приложение не может снять ограничение.'
+        )
+    return ''
+
+def flood_wait_notice(error):
+    description=f'{type(error).__name__}: {error}'.upper()
+    if 'FLOODWAITERROR' not in description and 'FLOOD_WAIT' not in description:
+        return ''
+    match=re.search(r'(?:WAIT OF|FLOOD_WAIT_)\s*(\d+)',description)
+    if match:
+        return f'Telegram временно ограничил отправку. Подождите {match.group(1)} секунд и повторите попытку.'
+    return 'Telegram временно ограничил отправку. Подождите и повторите попытку позже.'
 
 async def telegram_profile_snapshot(client,user):
     from telethon.tl.functions.users import GetFullUserRequest
@@ -517,11 +536,11 @@ class DialogSessionWorker(QObject):
         try:
             self.status.emit('Загружаю сообщения...')
             entity=self.entities.get(peer)
-            if entity is None: entity=await self.client.get_entity(int(peer))
-            messages=await self.client.get_messages(entity,limit=50)
-            lines=[await self._format_message(message) for message in reversed(messages)]
+            if entity is None: entity=await telegram_call(self.client.get_entity(int(peer)),'поиск диалога')
+            messages=await telegram_call(self.client.get_messages(entity,limit=50),'загрузка истории')
+            lines=await self._format_history_messages(messages)
             if peer in self.private_unread:
-                await self.client.send_read_acknowledge(entity)
+                await telegram_call(self.client.send_read_acknowledge(entity),'отметка сообщений прочитанными')
                 self.private_unread.pop(peer,None)
                 self.private_unread_changed.emit(self.session,sum(self.private_unread.values()))
             history='\n\n'.join(lines) or 'В этом диалоге пока нет сообщений.'
@@ -538,11 +557,11 @@ class DialogSessionWorker(QObject):
         self._history_in_progress=True
         try:
             entity=self.entities.get(peer)
-            if entity is None: entity=await self.client.get_entity(int(peer))
-            messages=await self.client.get_messages(entity,limit=50)
-            lines=[await self._format_message(message) for message in reversed(messages)]
+            if entity is None: entity=await telegram_call(self.client.get_entity(int(peer)),'поиск диалога')
+            messages=await telegram_call(self.client.get_messages(entity,limit=50),'обновление истории')
+            lines=await self._format_history_messages(messages)
             if peer in self.private_unread:
-                await self.client.send_read_acknowledge(entity)
+                await telegram_call(self.client.send_read_acknowledge(entity),'отметка сообщений прочитанными')
                 self.private_unread.pop(peer,None)
                 self.private_unread_changed.emit(self.session,sum(self.private_unread.values()))
             if peer==self.active_peer:
@@ -555,16 +574,32 @@ class DialogSessionWorker(QObject):
         finally:
             self._history_in_progress=False
 
+    async def _format_history_messages(self,messages):
+        loop=asyncio.get_running_loop()
+        deadline=loop.time()+60
+        lines=[]
+        for message in reversed(messages):
+            remaining=deadline-loop.time()
+            if remaining<=0:
+                lines.append('<p><i>Остальная часть истории не загружена: истекло время ожидания.</i></p>')
+                break
+            try:
+                lines.append(await asyncio.wait_for(self._format_message(message),timeout=remaining))
+            except asyncio.TimeoutError:
+                lines.append('<p><i>Остальная часть истории не загружена: истекло время ожидания.</i></p>')
+                break
+        return lines
+
     async def _send_message(self,peer,text):
         try:
             entity=self.entities.get(peer)
-            if entity is None: entity=await self.client.get_entity(int(peer))
+            if entity is None: entity=await telegram_call(self.client.get_entity(int(peer)),'поиск диалога')
             self.status.emit('Отправляю сообщение...')
-            message=await self.client.send_message(entity,text)
+            message=await telegram_call(self.client.send_message(entity,text),'отправка сообщения')
             self.message_sent.emit(peer,await self._format_message(message),True)
             self.status.emit('Сообщение отправлено.')
         except Exception as error:
-            self.failed.emit(f'{type(error).__name__}: {error}')
+            self.failed.emit(f'{type(error).__name__}: {str(error).strip() or repr(error)}')
 
     async def _format_message(self,message):
         date=message.date.astimezone().strftime('%Y-%m-%d %H:%M') if message.date else ''
@@ -607,7 +642,7 @@ class DialogSessionWorker(QObject):
             media_path=media_dir/f'{get_peer_id(message.peer_id)}_{message.id}{extension}'
             if not media_path.is_file() or media_path.stat().st_size==0:
                 try:
-                    downloaded=await self.client.download_media(message,file=str(media_path))
+                    downloaded=await telegram_call(self.client.download_media(message,file=str(media_path)),'загрузка медиа сообщения',timeout=45)
                     if not downloaded or not media_path.is_file() or media_path.stat().st_size==0:
                         raise RuntimeError('Telegram не вернул файл.')
                 except Exception as error:
@@ -663,10 +698,10 @@ class DialogSessionWorker(QObject):
     async def _send_media(self,peer,path,kind):
         try:
             entity=self.entities.get(peer)
-            if entity is None: entity=await self.client.get_entity(int(peer))
+            if entity is None: entity=await telegram_call(self.client.get_entity(int(peer)),'поиск диалога')
             self.status.emit({'photo':'Отправляю фото...','voice':'Отправляю голосовое...','video':'Отправляю видеокружок...'}[kind])
             options={'voice_note':kind=='voice','video_note':kind=='video'}
-            message=await self.client.send_file(entity,path,**options)
+            message=await telegram_call(self.client.send_file(entity,path,**options),'отправка медиа',timeout=60)
             self.message_sent.emit(peer,await self._format_message(message),False)
             self.status.emit({'photo':'Фото отправлено.','voice':'Голосовое отправлено.','video':'Видеокружок отправлен.'}[kind])
         except Exception as error:
@@ -975,7 +1010,11 @@ class TelegramDialogsWindow(QDialog):
         self._set_media_enabled(True)
 
     def _failed(self,error):
-        self.status_label.setText(f'Ошибка Telegram: {error}')
+        error=visible_error_message(error)
+        notice=spam_restriction_notice(error)
+        self.status_label.setText(notice or flood_wait_notice(error) or f'Ошибка Telegram: {error}')
+        if self.history.toPlainText().strip()=='Загружаю историю...':
+            self.history.setPlainText(notice or f'Не удалось загрузить историю: {error}')
         self._set_media_enabled(True)
 
     def closeEvent(self,event):
@@ -1871,7 +1910,7 @@ class Window(QMainWindow):
                 if account_row:
                     (deleted_accounts if account_status=='deleted' else invalid_accounts).append(account_row[0])
                 continue
-            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=COALESCE(?,avatar),about=COALESCE(?,about),account_status=\'\' WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
+            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=COALESCE(?,avatar),about=COALESCE(?,about),account_status=CASE WHEN account_status=\'restricted\' THEN account_status ELSE \'\' END WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
         self.conn.commit()
         self.refresh()
         if errors:
@@ -2008,10 +2047,16 @@ class Window(QMainWindow):
         dialog=TelegramDialogsWindow(name,session,api_id,api_hash,self)
         self.dialog_windows[session]=dialog
         dialog.privateUnreadChanged.connect(self.account_private_unread_changed)
-        dialog.worker.failed.connect(lambda error,account_session=session:self.mark_account_issue(account_session,error))
+        dialog.worker.failed.connect(lambda error,account_session=session:self.dialog_account_operation_failed(account_session,error),Qt.QueuedConnection)
         dialog.worker.connected.connect(self.account_dialog_connected)
         dialog.destroyed.connect(lambda _,account_session=session:self.account_dialog_closed(account_session))
         dialog.show()
+
+    def dialog_account_operation_failed(self,session,error):
+        self.mark_account_issue(session,error)
+        notice=spam_restriction_notice(error)
+        if not notice: return
+        QMessageBox.warning(self,'Ограничение аккаунта Telegram',notice)
 
     def account_dialog_connected(self,session):
         self.dialog_connected_sessions.add(session)
@@ -2550,7 +2595,7 @@ class Window(QMainWindow):
                 await self.do_send(api_id,api_hash,session,peer,text,join_peer)
                 sent.append(title)
             except Exception as error:
-                failures.append((title,str(error),session))
+                failures.append((title,visible_error_message(error),session))
         return sent,failures
     def chat_broadcast_finished(self,result,total):
         sent,failures=result
@@ -2561,6 +2606,10 @@ class Window(QMainWindow):
             if any(account_issue_from_error(error) for _,error,_ in failures):
                 self.refresh()
             details='\n'.join(f'• {title}: {error}' for title,error,_ in failures)
+            restricted=[title for title,error,_ in failures if spam_restriction_notice(error)]
+            if restricted:
+                details+='\n\nTelegram сообщил об ограничении аккаунта, связанном со спамом. '
+                details+='Аккаунт помечен как «Ограничен Telegram»; проверьте подробности в @SpamBot.'
             QMessageBox.warning(self,'Авторассылка завершена',f'Успешно: {len(sent)} из {total}.\n\nНе удалось отправить:\n{details}')
         else:
             QMessageBox.information(self,'Авторассылка завершена',f'Сообщение отправлено во все {total} чатов.')
@@ -2571,14 +2620,20 @@ class Window(QMainWindow):
         button.setEnabled(True); button.setText('➤ Отправить')
         if error:
             self.mark_account_issue(session,error)
-            message=str(error)
+            message=visible_error_message(error)
+            notice=spam_restriction_notice(message)
             lower=message.lower()
-            if 'connection to telegram failed' in lower:
+            if notice:
+                message=notice
+            elif 'connection to telegram failed' in lower:
                 message+=' Проверьте подключение к Интернету или прокси.'
             elif 'you can\'t write in this chat' in lower or 'sendmessagerequest' in lower:
                 message='Telegram запретил отправку в этот чат. Проверьте участие аккаунта и права на публикацию.'
             self.chat_status.setText(f'Ошибка отправки: {message}')
-            QMessageBox.critical(self,'Ошибка Telegram',message)
+            if notice:
+                QMessageBox.warning(self,'Ограничение аккаунта Telegram',message)
+            else:
+                QMessageBox.critical(self,'Ошибка Telegram',message)
         else:
             self.chat_status.setText('Сообщение отправлено в выбранный чат.')
     def chat_send_thread_finished(self,thread):
@@ -2589,6 +2644,12 @@ class Window(QMainWindow):
     def failed(self,e,session=''):
         e=visible_error_message(e)
         self.mark_account_issue(session,e)
+        notice=spam_restriction_notice(e)
+        if notice:
+            self.status.setText(notice)
+            QMessageBox.warning(self,'Ограничение аккаунта Telegram',notice)
+            self.thread.quit()
+            return
         message=str(e)
         lower=message.lower()
         if 'connection to telegram failed' in lower:
