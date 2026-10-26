@@ -115,6 +115,8 @@ def account_issue_from_error(error):
         return 'deleted'
     if any(marker in description for marker in ('USERDEACTIVATEDBANERROR','PHONENUMBERBANNEDERROR','ACCOUNTBANNEDERROR','ACCOUNTBANNED:')):
         return 'banned'
+    if any(marker in description for marker in ('AUTHKEYUNREGISTEREDERROR','AUTHKEYINVALIDERROR','SESSIONREVOKEDERROR')):
+        return 'invalid'
     if any(marker in description for marker in ('PEERFLOODERROR','USERRESTRICTEDERROR','ACCOUNTRESTRICTEDERROR','ACCOUNTRESTRICTED:')):
         return 'restricted'
     return ''
@@ -1084,12 +1086,13 @@ class Window(QMainWindow):
             self.account_table.setItem(r,1,QTableWidgetItem(display_name))
             self.account_table.setItem(r,2,QTableWidgetItem(f'@{username}' if username else ''))
             self.account_table.setItem(r,3,QTableWidgetItem(Path(session).name))
-            status_labels={'deleted':'Удалённый аккаунт','banned':'Заблокирован Telegram','restricted':'Ограничен Telegram'}
+            status_labels={'deleted':'Аккаунт удалён — больше не действителен','invalid':'Сессия больше не действительна','banned':'Заблокирован Telegram','restricted':'Ограничен Telegram'}
             status_item=QTableWidgetItem(status_labels.get(account_status,'● Профиль загружен' if first_name or username else 'Ожидает подключения'))
             if account_status in status_labels:
                 status_item.setForeground(QColor('#ff6b75'))
                 status_item.setToolTip(
-                    'Telegram пометил этот профиль как удалённый.' if account_status=='deleted'
+                    'Telegram пометил этот профиль как удалённый или больше не действительный.' if account_status=='deleted'
+                    else 'Telegram отозвал или больше не принимает эту сессию.' if account_status=='invalid'
                     else 'Telegram сообщил о блокировке аккаунта.' if account_status=='banned'
                     else 'Telegram ограничил отправку сообщений с этого аккаунта.'
                 )
@@ -1404,28 +1407,38 @@ class Window(QMainWindow):
         results=[]
         if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file(): await asyncio.to_thread(ensure_tgws_proxy)
         for index,(account_id,session_path) in enumerate(accounts,1):
-            if progress: progress(f'Проверяю профиль Telegram ({index}/{len(accounts)})...')
+            if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: подключаюсь к Telegram...')
             client=None
             result=None
             try:
-                client=TelegramClient(session_path,api_id,api_hash,timeout=10,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
+                client=TelegramClient(session_path,api_id,api_hash,timeout=8,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
                 try:
-                    await asyncio.wait_for(client.connect(),timeout=20)
-                    user=await asyncio.wait_for(client.get_me(),timeout=30)
+                    await asyncio.wait_for(client.connect(),timeout=12)
+                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: запрашиваю статус в Telegram...')
+                    user=await asyncio.wait_for(client.get_me(),timeout=20)
                 except asyncio.TimeoutError as error:
                     raise TimeoutError('Telegram не ответил вовремя. Проверьте подключение или прокси и повторите обновление профилей.') from error
-                if user is None: raise RuntimeError('Сессия не авторизована или Telegram не вернул профиль. Проверьте аккаунт и при необходимости импортируйте TDATA заново.')
-                if getattr(user,'deleted',False):
+                if user is None:
+                    result=(account_id,None,'','','','','','invalid','')
+                elif getattr(user,'deleted',False):
                     result=(account_id,user.id,'','','','','','deleted','')
                 else:
+                    first_name=user.first_name or ''
+                    last_name=user.last_name or ''
+                    username=user.username or ''
+                    avatar=None
+                    about=None
+                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: загружаю фото и сведения...')
                     try:
-                        first_name,last_name,username,avatar,about=await asyncio.wait_for(telegram_profile_snapshot(client,user),timeout=60)
-                    except asyncio.TimeoutError as error:
-                        raise TimeoutError('Telegram не ответил вовремя при загрузке профиля. Проверьте подключение или прокси и повторите обновление профилей.') from error
+                        first_name,last_name,username,avatar,about=await asyncio.wait_for(telegram_profile_snapshot(client,user),timeout=12)
+                    except asyncio.TimeoutError:
+                        if progress: progress(f'Аккаунт {index}/{len(accounts)} подтверждён; фото и дополнительные сведения не загрузились вовремя.')
                     result=(account_id,user.id,first_name,last_name,username,avatar,about,'','')
             except Exception as error:
                 if account_issue_from_error(error)=='deleted':
                     result=(account_id,None,'','','','','','deleted','')
+                elif account_issue_from_error(error)=='invalid':
+                    result=(account_id,None,'','','','','','invalid','')
                 else:
                     result=(account_id,None,'','','','','','',f'{type(error).__name__}: {error}')
             finally:
@@ -1441,18 +1454,20 @@ class Window(QMainWindow):
     def profiles_loaded(self,results,show_errors=True):
         errors=[]
         deleted_accounts=[]
+        invalid_accounts=[]
         for account_id,telegram_id,first_name,last_name,username,avatar,about,account_status,error in results:
             if error:
                 errors.append(error)
                 session_row=self.conn.execute('SELECT session FROM accounts WHERE id=?',(account_id,)).fetchone()
                 if session_row: self.mark_account_issue(session_row[0],error,refresh=False)
                 continue
-            if account_status=='deleted':
+            if account_status in ('deleted','invalid'):
                 self.conn.execute('UPDATE accounts SET telegram_id=?,account_status=? WHERE id=?',(telegram_id,account_status,account_id))
                 account_row=self.conn.execute('SELECT name FROM accounts WHERE id=?',(account_id,)).fetchone()
-                if account_row: deleted_accounts.append(account_row[0])
+                if account_row:
+                    (deleted_accounts if account_status=='deleted' else invalid_accounts).append(account_row[0])
                 continue
-            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=?,about=?,account_status=\'\' WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
+            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=COALESCE(?,avatar),about=COALESCE(?,about),account_status=\'\' WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
         self.conn.commit()
         self.refresh()
         if errors:
@@ -1463,10 +1478,12 @@ class Window(QMainWindow):
             write_import_log(f'Не удалось загрузить данные профиля: {error_text}')
             if show_errors: QMessageBox.warning(self,'Профили Telegram',error_text)
         else:
-            if deleted_accounts:
-                names=', '.join(deleted_accounts)
-                self.import_status.setText(f'Telegram пометил как удалённые аккаунты: {names}.')
-                write_import_log(f'Telegram пометил как удалённые аккаунты: {names}')
+            if deleted_accounts or invalid_accounts:
+                status_messages=[]
+                if deleted_accounts: status_messages.append(f'Удалённые или недействительные: {", ".join(deleted_accounts)}')
+                if invalid_accounts: status_messages.append(f'Сессия больше недействительна: {", ".join(invalid_accounts)}')
+                self.import_status.setText('; '.join(status_messages)+'.')
+                write_import_log('Результат проверки аккаунтов: '+'; '.join(status_messages))
             else:
                 self.import_status.setText('Имена и аватары профилей обновлены.')
                 write_import_log(f'Данные профилей Telegram обновлены: {len(results)}')
@@ -1489,6 +1506,7 @@ class Window(QMainWindow):
             self.refresh()
         messages={
             'deleted':'Telegram сообщил, что аккаунт удалён.',
+            'invalid':'Telegram больше не принимает эту сессию аккаунта.',
             'banned':'Telegram сообщил, что аккаунт заблокирован.',
             'restricted':'Telegram ограничил отправку сообщений с этого аккаунта.',
         }
