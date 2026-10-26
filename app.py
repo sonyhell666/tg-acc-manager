@@ -379,6 +379,7 @@ class ImportWorker(QObject):
 class DialogSessionWorker(QObject):
     dialogs_batch=Signal(object); dialogs_loaded=Signal(int); history_loaded=Signal(str,str)
     message_sent=Signal(str,str,bool); message_received=Signal(str,str,str,str,int)
+    sender_info_ready=Signal(object)
     private_unread_changed=Signal(str,int)
     status=Signal(str); failed=Signal(str); connected=Signal(str); stopped=Signal()
     def __init__(self,session,api_id,api_hash):
@@ -414,6 +415,31 @@ class DialogSessionWorker(QObject):
 
     def send_message(self,peer,text):
         self._submit(self._send_message(peer,text))
+
+    def load_sender_info(self,peer_id):
+        self._submit(self._load_sender_info(peer_id))
+
+    async def _load_sender_info(self,peer_id):
+        from telethon.tl.types import User
+        try:
+            entity=self.entities.get(str(peer_id))
+            if entity is None:
+                entity=await telegram_call(self.client.get_entity(int(peer_id)),'загрузка информации об отправителе')
+                self.entities[str(peer_id)]=entity
+            if not isinstance(entity,User):
+                raise RuntimeError('Информация доступна только для отправителей-аккаунтов Telegram.')
+            first_name=getattr(entity,'first_name','') or ''
+            last_name=getattr(entity,'last_name','') or ''
+            display_name=' '.join(part for part in (first_name,last_name) if part).strip() or 'Имя не указано'
+            self.sender_info_ready.emit({
+                'peer_id':str(peer_id),
+                'name':display_name,
+                'username':getattr(entity,'username',None) or '',
+                'is_bot':bool(getattr(entity,'bot',False)),
+                'is_user':True,
+            })
+        except Exception as error:
+            self.failed.emit(f'Не удалось загрузить информацию об отправителе: {visible_error_message(error)}')
 
     def stop(self):
         if self.loop is None or self._closing: return
@@ -542,11 +568,29 @@ class DialogSessionWorker(QObject):
 
     async def _format_message(self,message):
         date=message.date.astimezone().strftime('%Y-%m-%d %H:%M') if message.date else ''
-        sender='Вы' if message.out else 'Собеседник'
+        sender='Вы'
+        sender_peer=None
+        if not message.out:
+            from telethon.tl.types import PeerUser, User
+            sender_entity=getattr(message,'sender',None)
+            from_id=getattr(message,'from_id',None)
+            if isinstance(from_id,PeerUser):
+                sender_peer=str(from_id.user_id)
+            if isinstance(sender_entity,User):
+                if sender_peer: self.entities[sender_peer]=sender_entity
+                sender=' '.join(part for part in (sender_entity.first_name or '',sender_entity.last_name or '') if part).strip() or 'Собеседник'
+                if sender_entity.username: sender+=f' (@{sender_entity.username})'
+            elif sender_entity is not None:
+                sender=getattr(sender_entity,'title',None) or sender
+        sender_html=html.escape(sender)
+        if sender_peer:
+            sender_html=f'<a href="tgsender:{sender_peer}">{sender_html}</a>'
         text=message.message or ''
-        content=f'<p><b>[{date}] {sender}:</b>'
+        content=f'<p><b>[{html.escape(date)}] {sender_html}:</b>'
         if text:
             content+=f'<br/>{html.escape(text).replace(chr(10), "<br/>")}'
+        elif getattr(message,'action',None):
+            content+=f'<br/><i>{html.escape(self._service_message_text(message.action))}</i>'
         media_kind=None
         media_label=''
         extension=''
@@ -574,9 +618,37 @@ class DialogSessionWorker(QObject):
                     content+=self._media_html(media_kind,media_label,media_path)
             else:
                 content+=self._media_html(media_kind,media_label,media_path)
-        elif not text:
+        elif not text and not getattr(message,'action',None):
             content+='<br/><i>[Медиа- или служебное сообщение]</i>'
         return content+'</p>'
+
+    @staticmethod
+    def _service_message_text(action):
+        action_name=type(action).__name__
+        title=getattr(action,'title',None)
+        descriptions={
+            'MessageActionChatCreate':f'Создана группа «{title}».' if title else 'Создана группа.',
+            'MessageActionChannelCreate':f'Создан канал «{title}».' if title else 'Создан канал.',
+            'MessageActionChatEditTitle':f'Название группы изменено на «{title}».' if title else 'Изменено название группы.',
+            'MessageActionChatEditPhoto':'Изменена фотография группы.',
+            'MessageActionChatDeletePhoto':'Удалена фотография группы.',
+            'MessageActionChatJoinedByLink':'Участник присоединился по пригласительной ссылке.',
+            'MessageActionChatJoinedByRequest':'Заявка на вступление одобрена.',
+            'MessageActionChatDeleteUser':'Участник покинул группу или был удалён.',
+            'MessageActionChatAddUser':'В группу добавлен участник.',
+            'MessageActionPinMessage':'Сообщение закреплено.',
+            'MessageActionHistoryClear':'История сообщений очищена.',
+            'MessageActionChannelMigrateFrom':'Группа преобразована в супергруппу.',
+            'MessageActionChatMigrateTo':'Группа преобразована в супергруппу.',
+            'MessageActionTopicCreate':f'Создана тема «{title}».' if title else 'Создана тема.',
+            'MessageActionTopicEdit':f'Изменена тема «{title}».' if title else 'Изменены настройки темы.',
+            'MessageActionGroupCall':'Групповой звонок.',
+            'MessageActionGroupCallScheduled':'Запланирован групповой звонок.',
+            'MessageActionPhoneCall':'Телефонный звонок.',
+            'MessageActionScreenshotTaken':'Сделан снимок экрана.',
+            'MessageActionContactSignUp':'Контакт зарегистрировался в Telegram.',
+        }
+        return descriptions.get(action_name,f'Служебное событие Telegram ({action_name.removeprefix("MessageAction") or "событие"}).')
 
     @staticmethod
     def _media_html(media_kind,label,path):
@@ -675,6 +747,7 @@ class TelegramDialogsWindow(QDialog):
         self.worker.dialogs_batch.connect(self._add_dialogs); self.worker.dialogs_loaded.connect(self._dialogs_loaded)
         self.worker.history_loaded.connect(self._history_loaded); self.worker.message_sent.connect(self._message_sent)
         self.worker.message_received.connect(self._message_received)
+        self.worker.sender_info_ready.connect(self._show_sender_info)
         self.worker.private_unread_changed.connect(self.privateUnreadChanged)
         self.worker.connected.connect(self._connected)
         self.worker.failed.connect(self._failed); self.worker.stopped.connect(self._thread.quit)
@@ -756,6 +829,11 @@ class TelegramDialogsWindow(QDialog):
         self.worker.send_media(item.data(Qt.UserRole),path,kind)
 
     def _open_media(self,url):
+        if url.scheme()=='tgsender':
+            peer_id=url.toString().split(':',1)[1]
+            self.status_label.setText('Загружаю информацию об отправителе...')
+            self.worker.load_sender_info(peer_id)
+            return
         if url.scheme()!='tgmedia': return
         token=url.toString().split(':',1)[1]
         try:
@@ -771,6 +849,45 @@ class TelegramDialogsWindow(QDialog):
             player.destroyed.connect(lambda _,window=player:self._media_players.remove(window) if window in self._media_players else None)
         except Exception as error:
             self.status_label.setText(f'Не удалось открыть медиа: {error}')
+
+    def _show_sender_info(self,info):
+        if not info.get('is_user'):
+            self.status_label.setText('Отправитель не является личным аккаунтом Telegram.')
+            return
+        dialog=QDialog(self); dialog.setWindowTitle('Информация об отправителе'); dialog.setMinimumWidth(340)
+        layout=QVBoxLayout(dialog); form=QFormLayout()
+        form.addRow('Имя',QLabel(info.get('name') or 'Не указано'))
+        form.addRow('Username',QLabel(f'@{info["username"]}' if info.get('username') else 'Не указан'))
+        layout.addLayout(form)
+        if info.get('is_bot'):
+            note=QLabel('Это бот Telegram.'); note.setObjectName('muted'); layout.addWidget(note)
+        buttons=QDialogButtonBox()
+        write_button=buttons.addButton('Написать сообщение',QDialogButtonBox.AcceptRole)
+        close_button=buttons.addButton('Закрыть',QDialogButtonBox.RejectRole)
+        write_button.setEnabled(not info.get('is_bot'))
+        write_button.clicked.connect(dialog.accept); close_button.clicked.connect(dialog.reject)
+        layout.addWidget(buttons)
+        should_open=dialog.exec()==QDialog.Accepted
+        if should_open:
+            self._open_sender_chat(info)
+
+    def _open_sender_chat(self,info):
+        peer=str(info['peer_id'])
+        item=self._find_dialog_item(peer,self.personal_dialog_list)
+        if item is None:
+            item=QListWidgetItem()
+            item.setData(Qt.UserRole,peer)
+            item.setData(Qt.UserRole+1,info.get('name') or peer)
+            item.setData(Qt.UserRole+2,0)
+            item.setData(Qt.UserRole+3,'')
+            self.personal_dialog_list.insertItem(0,item)
+            self._update_dialog_label(item)
+        else:
+            item.setData(Qt.UserRole+1,info.get('name') or item.data(Qt.UserRole+1))
+            self._update_dialog_label(item)
+        self.dialog_tabs.setCurrentWidget(self.personal_dialog_list)
+        self.personal_dialog_list.setCurrentItem(item)
+        self.status_label.setText('Открыта личная переписка с отправителем.')
 
     def _message_received(self,peer,title,category,rendered,unread_count):
         dialog_list=self.personal_dialog_list if category=='personal' else self.group_dialog_list
