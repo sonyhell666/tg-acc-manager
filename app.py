@@ -2650,27 +2650,46 @@ class Window(QMainWindow):
             return
         recipients=[(title,peer,session,join_peer or '') for title,peer,session,join_peer in chats]
         self.chat_status.setText(f'Авторассылка выполняется по {len(recipients)} чатам...')
+        self.chat_progress.setRange(0,len(recipients))
+        self.chat_progress.setValue(0)
+        self.chat_progress.setFormat('Обработано %v из %m чатов')
+        self.chat_progress.setTextVisible(True)
+        self.chat_progress.show()
         self.chat_broadcast_button.setEnabled(False)
-        thread=QThread(self); worker=Worker(lambda:self.do_broadcast(api_id,api_hash,text,recipients))
+        thread=QThread(self); worker=Worker(lambda _,item:self.do_broadcast(api_id,api_hash,text,recipients,item),with_progress=True)
         self.chat_send_thread=thread; self.chat_send_worker=worker
         worker.moveToThread(thread); thread.started.connect(worker.run)
         worker.done.connect(lambda result:self.chat_broadcast_finished(result,len(recipients)),Qt.QueuedConnection)
-        worker.error.connect(self.chat_broadcast_failed)
+        worker.item.connect(self.chat_broadcast_progress,Qt.QueuedConnection)
+        worker.error.connect(self.chat_broadcast_failed,Qt.QueuedConnection)
         worker.done.connect(thread.quit,Qt.DirectConnection); worker.error.connect(thread.quit,Qt.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda finished=thread:self.chat_send_thread_finished(finished))
         thread.start()
-    async def do_broadcast(self,api_id,api_hash,text,recipients):
+    async def do_broadcast(self,api_id,api_hash,text,recipients,progress=None):
         sent=[]; failures=[]
-        for title,peer,session,join_peer in recipients:
+        total=len(recipients)
+        for index,(title,peer,session,join_peer) in enumerate(recipients,1):
+            if progress:
+                progress((index,total,title,len(sent),len(failures),False))
             try:
                 await self.do_send(api_id,api_hash,session,peer,text,join_peer)
                 sent.append(title)
             except Exception as error:
                 failures.append((title,visible_error_message(error),session))
+            if progress:
+                progress((index,total,title,len(sent),len(failures),True))
         return sent,failures
+    def chat_broadcast_progress(self,event):
+        current,total,title,sent_count,failed_count,finished=event
+        completed=current if finished else current-1
+        self.chat_progress.setRange(0,total)
+        self.chat_progress.setValue(completed)
+        state='Обработано' if finished else 'Отправляю'
+        self.chat_status.setText(f'Авторассылка: {state} {current} из {total} — «{title}». Успешно: {sent_count}, ошибки: {failed_count}.')
     def chat_broadcast_finished(self,result,total):
         sent,failures=result
+        self.chat_progress.hide()
         self.chat_status.setText(f'Авторассылка завершена: успешно отправлено в {len(sent)} из {total} чатов.')
         if failures:
             for _,error,session in failures:
@@ -2686,6 +2705,7 @@ class Window(QMainWindow):
         else:
             QMessageBox.information(self,'Авторассылка завершена',f'Сообщение отправлено во все {total} чатов.')
     def chat_broadcast_failed(self,error):
+        self.chat_progress.hide()
         self.chat_status.setText(f'Ошибка авторассылки: {error}')
         QMessageBox.critical(self,'Ошибка авторассылки',str(error))
     def chat_default_send_finished(self,button,error,session=''):
