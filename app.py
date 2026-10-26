@@ -3,7 +3,7 @@ import asyncio, base64, hashlib, html, json, os, re, shutil, socket, sqlite3, su
 from datetime import datetime
 import urllib.error, urllib.request
 from pathlib import Path
-from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl, QEvent
+from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl, QEvent, QLockFile
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -150,6 +150,8 @@ def download_latest_app_update():
     return commit_sha,source,icon_data
 
 def account_issue_from_error(error):
+    if 'сессия аккаунта не авторизована' in str(error).casefold():
+        return 'invalid'
     description=re.sub(r'[^A-Z0-9:]', '', f'{type(error).__name__}: {error}'.upper())
     if 'USERDEACTIVATEDERROR' in description and 'USERDEACTIVATEDBANERROR' not in description:
         return 'deleted'
@@ -365,6 +367,20 @@ async def connect_account_client(client,timeout=20):
         authorized=await asyncio.wait_for(client.is_user_authorized(),timeout=timeout)
     except asyncio.TimeoutError as error:
         raise TimeoutError(f'Telegram не ответил за {timeout} секунд. Проверьте Интернет и выбранный прокси.') from error
+    except (asyncio.IncompleteReadError,ConnectionError,OSError) as error:
+        try:
+            proxy_mode,_=configured_proxy_settings()
+        except RuntimeError:
+            proxy_mode=''
+        if proxy_mode=='local':
+            raise ConnectionError(
+                'Локальный TgWsProxy доступен, но соединение с Telegram оборвалось во время обмена данными. '
+                'Проверьте конфигурацию прокси и доступ к Telegram или выберите «Без прокси». '
+                f'Причина: {type(error).__name__}: {error}'
+            ) from error
+        raise ConnectionError(
+            f'Соединение с Telegram оборвалось до завершения подключения: {type(error).__name__}: {error}'
+        ) from error
     if not authorized:
         raise RuntimeError('Сессия аккаунта не авторизована. Повторно импортируйте TDATA этого аккаунта.')
 
@@ -1718,14 +1734,15 @@ class Window(QMainWindow):
             status.setText(f'Некорректные настройки: {error}')
             status.setStyleSheet('color:#ff7777')
             return
-        status.setText('Запускаю локальный прокси и проверяю Telegram...' if proxy_mode=='local' else 'Проверяю прямое соединение с Telegram...' if proxy_mode=='none' else 'Проверяю подключение через указанный прокси...')
+        status.setText('Подготовка проверки подключения...')
         status.setStyleSheet('color:#e6b450')
         thread=QThread(self)
-        worker=Worker(lambda:self.check_telegram_connection(api_id,api_hash,client_options,proxy_mode))
+        worker=Worker(lambda progress,_:self.check_telegram_connection(api_id,api_hash,client_options,proxy_mode,progress),with_progress=True)
         self.proxy_test_thread=thread
         self.proxy_test_worker=worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        worker.progress.connect(status.setText,Qt.QueuedConnection)
         success_message='Прямое подключение к Telegram работает.' if proxy_mode=='none' else 'Подключение к Telegram через TgWsProxy работает.' if proxy_mode=='local' else 'Подключение к Telegram через этот прокси работает.'
         worker.done.connect(lambda _:self.proxy_test_finished(status,True,success_message,proxy_mode),Qt.QueuedConnection)
         worker.error.connect(lambda error:self.proxy_test_finished(status,False,error,proxy_mode),Qt.QueuedConnection)
@@ -1734,14 +1751,17 @@ class Window(QMainWindow):
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda:self.proxy_test_thread_stopped(thread))
         thread.start()
+        QTimer.singleShot(35000,lambda:self.proxy_test_timed_out(status,thread,proxy_mode))
 
-    async def check_telegram_connection(self,api_id,api_hash,client_options,proxy_mode):
+    async def check_telegram_connection(self,api_id,api_hash,client_options,proxy_mode,progress=None):
         from telethon.sessions import StringSession
         if proxy_mode=='local':
+            if progress: progress('Запускаю локальный TgWsProxy (таймаут запуска — 10 секунд)...')
             try:
                 await asyncio.wait_for(asyncio.to_thread(ensure_tgws_proxy),timeout=12)
             except asyncio.TimeoutError as error:
                 raise TimeoutError('Локальный TgWsProxy не запустился за 12 секунд.') from error
+        if progress: progress('Подключаюсь к серверам Telegram (таймаут — 15 секунд)...')
         client=TelegramClient(StringSession(),api_id,api_hash,**client_options,timeout=5,connection_retries=0,retry_delay=1)
         try:
             try:
@@ -1750,22 +1770,36 @@ class Window(QMainWindow):
                 raise TimeoutError('Выбранный способ подключения не завершил соединение с Telegram за 15 секунд.') from error
             if not client.is_connected():
                 raise ConnectionError('Telegram не подтвердил подключение.')
+            if progress: progress('Telegram ответил; закрываю тестовое соединение...')
             return True
         finally:
             try:
                 await asyncio.wait_for(client.disconnect(),timeout=2)
             except asyncio.TimeoutError:
-                pass
+                write_import_log('Тайм-аут при закрытии тестового соединения Telegram.')
 
     def proxy_test_finished(self,status,success,message,proxy_mode):
+        message=visible_error_message(message) if not success else message
         if success:
             status.setText(message)
             status.setStyleSheet('color:#6fce8b')
         else:
-            if 'Connection to Telegram failed' in message:
+            if proxy_mode=='local' and ('IncompleteReadError' in message or 'Connection to Telegram failed 0 time(s)' in message):
+                message='TgWsProxy доступен на компьютере, но Telegram не завершил соединение через него. Проверьте конфигурацию прокси и доступность серверов Telegram либо выберите «Без прокси».'
+            elif 'No workers running' in message:
+                message='Telegram вернул «No workers running» при проверке соединения. Проверьте доступность выбранного маршрута через TgWsProxy или повторите проверку без прокси.'
+            elif 'Connection to Telegram failed' in message:
                 message='Не удалось подключиться к Telegram. Проверьте Интернет.' if proxy_mode=='none' else 'Не удалось подключиться к Telegram. Проверьте наличие локального прокси и его конфигурацию.' if proxy_mode=='local' else 'Не удалось подключиться к Telegram. Проверьте адрес, порт, логин и пароль прокси.'
             status.setText(f'Ошибка подключения: {message}')
             status.setStyleSheet('color:#ff7777')
+
+    def proxy_test_timed_out(self,status,thread,proxy_mode):
+        if not thread.isRunning():
+            return
+        message='Проверка подключения не завершилась за 35 секунд. Фоновая проверка ещё выполняется; проверьте журнал и доступность прокси.'
+        write_import_log(f'Тайм-аут проверки подключения к Telegram в режиме {proxy_mode}.')
+        status.setText(message)
+        status.setStyleSheet('color:#ff7777')
 
     def proxy_test_thread_stopped(self,thread):
         if self.proxy_test_thread is thread: self.proxy_test_thread=None
@@ -2073,9 +2107,19 @@ class Window(QMainWindow):
             QMessageBox.information(self,'Аккаунт удалён',f'Аккаунт «{name}» и его локальные файлы удалены.')
 
     def profile_load_failed(self,error,show_dialog=True):
-        self.import_status.setText(f'Не удалось загрузить профили: {error}')
-        write_import_log(f'Ошибка загрузки профилей: {error}')
-        if show_dialog: QMessageBox.warning(self,'Профили Telegram',error)
+        message=visible_error_message(error)
+        try:
+            with self.conn:
+                self.conn.execute(
+                    'UPDATE accounts SET account_status=\'connection_error\' WHERE account_status=\'\''
+                )
+        except sqlite3.Error as database_error:
+            write_import_log(f'Не удалось обновить статусы аккаунтов после ошибки загрузки профилей: {database_error}')
+            message+=f'\nНе удалось сохранить статус ошибки в базе данных: {database_error}'
+        self.refresh()
+        self.import_status.setText(f'Не удалось загрузить профили: {message}')
+        write_import_log(f'Ошибка загрузки профилей: {message}')
+        if show_dialog: QMessageBox.warning(self,'Профили Telegram',message)
 
     def edit_account_profile(self,account_id,session):
         if any(thread and thread.isRunning() for thread in (self.profile_edit_thread,self.profile_thread)):
@@ -2844,4 +2888,13 @@ if __name__=='__main__':
         import ctypes
         result=ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('TG.Manager.Desktop')
         if result: write_import_log(f'Не удалось назначить идентификатор значка приложения Windows: HRESULT {result}')
-    app=QApplication(sys.argv); app.setWindowIcon(QIcon(str(ROOT/'tg-manager.ico'))); app.setStyleSheet(STYLE); win=Window(); win.show(); sys.exit(app.exec())
+    app=QApplication(sys.argv); app.setWindowIcon(QIcon(str(ROOT/'tg-manager.ico'))); app.setStyleSheet(STYLE)
+    instance_lock=QLockFile(str(DATA/'tg-manager.lock')); instance_lock.setStaleLockTime(30000)
+    if not instance_lock.tryLock(0):
+        QMessageBox.information(None,'TG Manager уже запущен','Уже работает другой экземпляр TG Manager. Закройте его перед запуском этой копии, чтобы аккаунты и база данных не использовались одновременно.')
+        sys.exit(0)
+    write_import_log(f'TG Manager запущен с блокировкой единственного экземпляра (PID {os.getpid()}).')
+    win=Window(); win.show()
+    exit_code=app.exec()
+    instance_lock.unlock()
+    sys.exit(exit_code)
