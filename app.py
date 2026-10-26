@@ -1405,17 +1405,16 @@ class Window(QMainWindow):
         if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file(): await asyncio.to_thread(ensure_tgws_proxy)
         for index,(account_id,session_path) in enumerate(accounts,1):
             if progress: progress(f'Проверяю профиль Telegram ({index}/{len(accounts)})...')
-            client=TelegramClient(session_path,api_id,api_hash,timeout=10,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
+            client=None
             result=None
             try:
+                client=TelegramClient(session_path,api_id,api_hash,timeout=10,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
                 try:
                     await asyncio.wait_for(client.connect(),timeout=20)
-                    if not await asyncio.wait_for(client.is_user_authorized(),timeout=15):
-                        raise RuntimeError('Сессия не авторизована. Подключите аккаунт заново через импорт TDATA.')
                     user=await asyncio.wait_for(client.get_me(),timeout=30)
                 except asyncio.TimeoutError as error:
                     raise TimeoutError('Telegram не ответил вовремя. Проверьте подключение или прокси и повторите обновление профилей.') from error
-                if user is None: raise RuntimeError('Telegram не вернул данные профиля.')
+                if user is None: raise RuntimeError('Сессия не авторизована или Telegram не вернул профиль. Проверьте аккаунт и при необходимости импортируйте TDATA заново.')
                 if getattr(user,'deleted',False):
                     result=(account_id,user.id,'','','','','','deleted','')
                 else:
@@ -1430,11 +1429,12 @@ class Window(QMainWindow):
                 else:
                     result=(account_id,None,'','','','','','',f'{type(error).__name__}: {error}')
             finally:
-                try:
-                    await asyncio.wait_for(client.disconnect(),timeout=10)
-                except asyncio.TimeoutError:
-                    if result is None or not result[8]:
-                        result=(account_id,None,'','','','','','', 'Не удалось вовремя закрыть соединение с Telegram.')
+                if client is not None:
+                    try:
+                        await asyncio.wait_for(client.disconnect(),timeout=10)
+                    except Exception as error:
+                        if result is None:
+                            result=(account_id,None,'','','','','','',f'Не удалось закрыть соединение с Telegram: {type(error).__name__}: {error}')
             results.append(result)
         return results
 
