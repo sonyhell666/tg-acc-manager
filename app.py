@@ -180,6 +180,11 @@ def flood_wait_notice(error):
         return f'Telegram временно ограничил отправку. Подождите {match.group(1)} секунд и повторите попытку.'
     return 'Telegram временно ограничил отправку. Подождите и повторите попытку позже.'
 
+def round_robin_chat_assignments(chat_ids,account_sessions):
+    if not account_sessions:
+        return []
+    return [(chat_id,account_sessions[index % len(account_sessions)]) for index,chat_id in enumerate(chat_ids)]
+
 async def telegram_profile_snapshot(client,user):
     from telethon.tl.functions.users import GetFullUserRequest
     full=await telegram_call(client(GetFullUserRequest(user)),'получение данных профиля',timeout=20)
@@ -1239,7 +1244,7 @@ class Window(QMainWindow):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); h=QHBoxLayout(); h.addWidget(self.heading('Аккаунты','Импортируйте профили Telegram Desktop; имя и статус обновляются из Telegram')); refresh=QPushButton('⟳ Обновить профили'); refresh.clicked.connect(self.refresh_profiles); h.addWidget(refresh,0,Qt.AlignTop); b=QPushButton('＋ Импорт ZIP'); b.clicked.connect(self.import_zip); h.addWidget(b,0,Qt.AlignTop); folder=QPushButton('Импорт папки TDATA'); folder.clicked.connect(self.import_folder); h.addWidget(folder,0,Qt.AlignTop); l.addLayout(h); self.import_status=QLabel('Выберите ZIP-архив или папку tdata'); self.import_status.setObjectName('muted'); l.addWidget(self.import_status);         self.account_table=self.make_table(['Фото','Имя аккаунта','Username','Файл сессии','Статус','Профиль','Диалоги','Действия']); self.account_table.setIconSize(QPixmap(40,40).size()); l.addWidget(self.account_table); return w
     def chats_page(self):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30)
-        h=QHBoxLayout(); h.addWidget(self.heading('Чаты','Назначьте аккаунт каждому чату и отправляйте сообщения отдельно или всем списком')); self.chat_folder_button=QPushButton('＋ Импорт папки чатов'); self.chat_folder_button.clicked.connect(self.import_chat_folder); h.addWidget(self.chat_folder_button,0,Qt.AlignTop); b=QPushButton('＋ Добавить группу'); b.clicked.connect(self.add_chat); h.addWidget(b,0,Qt.AlignTop); self.chat_broadcast_button=QPushButton('Авторассылка'); self.chat_broadcast_button.setObjectName('primary'); self.chat_broadcast_button.setToolTip('Отправить сообщение по умолчанию во все сохранённые чаты'); self.chat_broadcast_button.clicked.connect(self.send_to_all_chats); h.addWidget(self.chat_broadcast_button,0,Qt.AlignTop); l.addLayout(h)
+        h=QHBoxLayout(); h.addWidget(self.heading('Чаты','Назначьте аккаунт каждому чату и отправляйте сообщения отдельно или всем списком')); self.chat_folder_button=QPushButton('＋ Импорт папки чатов'); self.chat_folder_button.clicked.connect(self.import_chat_folder); h.addWidget(self.chat_folder_button,0,Qt.AlignTop); b=QPushButton('＋ Добавить группу'); b.clicked.connect(self.add_chat); h.addWidget(b,0,Qt.AlignTop); self.chat_auto_assign_button=QPushButton('Автораспределить аккаунты'); self.chat_auto_assign_button.setToolTip('Равномерно распределить добавленные аккаунты по всем чатам; текущие назначения будут заменены'); self.chat_auto_assign_button.clicked.connect(self.auto_assign_chat_accounts); h.addWidget(self.chat_auto_assign_button,0,Qt.AlignTop); self.chat_broadcast_button=QPushButton('Авторассылка'); self.chat_broadcast_button.setObjectName('primary'); self.chat_broadcast_button.setToolTip('Отправить сообщение по умолчанию во все сохранённые чаты'); self.chat_broadcast_button.clicked.connect(self.send_to_all_chats); h.addWidget(self.chat_broadcast_button,0,Qt.AlignTop); l.addLayout(h)
         self.chat_status=QLabel('Для каждого чата выберите аккаунт. «Авторассылка» отправит сообщение по умолчанию во все чаты списка.'); self.chat_status.setObjectName('muted'); l.addWidget(self.chat_status)
         self.chat_progress=QProgressBar(); self.chat_progress.setRange(0,0); self.chat_progress.setTextVisible(False); self.chat_progress.setMaximumHeight(8); self.chat_progress.hide(); l.addWidget(self.chat_progress)
         default_box=QFrame(); default_box.setObjectName('panel'); default_layout=QVBoxLayout(default_box)
@@ -1575,6 +1580,37 @@ class Window(QMainWindow):
         except sqlite3.Error as error:
             self.chat_status.setText(f'Не удалось сохранить аккаунт для чата: {error}')
             QMessageBox.critical(self,'Аккаунт чата',str(error))
+    def auto_assign_chat_accounts(self):
+        accounts=list(self.conn.execute('SELECT session FROM accounts ORDER BY name'))
+        chats=list(self.conn.execute('SELECT id,title FROM chats ORDER BY is_pinned DESC,title COLLATE NOCASE'))
+        if not accounts:
+            QMessageBox.information(self,'Автораспределение аккаунтов','Сначала добавьте хотя бы один аккаунт.')
+            return
+        if not chats:
+            QMessageBox.information(self,'Автораспределение аккаунтов','Сначала добавьте хотя бы один чат.')
+            return
+        answer=QMessageBox.question(
+            self,
+            'Автораспределить аккаунты',
+            f'Распределить {len(accounts)} аккаунтов по {len(chats)} чатам равномерно? '
+            'Текущие назначения всех чатов будут заменены.',
+            QMessageBox.Yes|QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer!=QMessageBox.Yes:
+            return
+        assignments=round_robin_chat_assignments(
+            [chat_id for chat_id,_ in chats],
+            [session for session, in accounts],
+        )
+        try:
+            with self.conn:
+                self.conn.executemany('UPDATE chats SET assigned_session=? WHERE id=?',[(session,chat_id) for chat_id,session in assignments])
+        except sqlite3.Error as error:
+            QMessageBox.critical(self,'Автораспределение аккаунтов',f'Не удалось сохранить назначения аккаунтов: {error}')
+            return
+        self.refresh()
+        self.chat_status.setText(f'Аккаунты распределены по {len(chats)} чатам равномерно.')
     def avatar_placeholder(self,label):
         pixmap=QPixmap(40,40); pixmap.fill(Qt.transparent); painter=QPainter(pixmap); painter.setRenderHint(QPainter.Antialiasing); painter.setBrush(QColor('#263b5c')); painter.setPen(Qt.NoPen); painter.drawEllipse(1,1,38,38); painter.setPen(QColor('#ffffff')); painter.drawText(pixmap.rect(),Qt.AlignCenter,(label[:1] or '?').upper()); painter.end(); return QIcon(pixmap)
 
