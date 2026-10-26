@@ -3,7 +3,7 @@ import asyncio, base64, hashlib, html, json, os, re, shutil, socket, sqlite3, su
 import urllib.error, urllib.request
 from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl
-from PySide6.QtGui import QColor, QIcon, QPainter, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import *
@@ -18,6 +18,7 @@ TGWS_PROXY_BUNDLED_CONFIG=TGWS_PROXY_BIN/'tg-ws-proxy-config.json'
 TGWS_PROXY_CONFIG=Path(os.environ.get('APPDATA',Path.home()/'AppData'/'Roaming'))/'TgWsProxy'/'config.json'
 UPDATE_REPOSITORY='sonyhell666/tg-acc-manager'
 UPDATE_BRANCH='main'
+UPDATE_CHECK_INTERVAL_MS=6*60*60*1000
 DATA.mkdir(parents=True,exist_ok=True); SESSIONS.mkdir(parents=True,exist_ok=True)
 _LOCAL_PROXY_PROCESS=None
 try: LOG.write_text('TG Manager app.py запущен\n',encoding='utf-8')
@@ -42,6 +43,19 @@ def database():
     if 'assigned_session' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN assigned_session TEXT NOT NULL DEFAULT \'\'')
     if 'chat_type' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT \'\'')
     c.commit(); return c
+
+def telegram_mark_icon(size=24):
+    pixmap=QPixmap(size,size); pixmap.fill(Qt.transparent)
+    painter=QPainter(pixmap); painter.setRenderHint(QPainter.Antialiasing)
+    painter.setBrush(QColor('#2AABEE')); painter.setPen(Qt.NoPen)
+    painter.drawEllipse(1,1,size-2,size-2)
+    painter.scale(size/24,size/24)
+    plane=QPainterPath(); plane.moveTo(4,11); plane.lineTo(20,4); plane.cubicTo(20.8,3.7,21.4,4.1,21.1,5.2); plane.lineTo(18.2,19.2); plane.cubicTo(18,20,17.5,20.2,16.8,19.7); plane.lineTo(12.6,16.5); plane.lineTo(10.3,18.7); plane.cubicTo(9.8,19.1,9.4,18.9,9.4,18.3); plane.lineTo(9.7,13.9); plane.closeSubpath()
+    painter.setBrush(QColor('white')); painter.drawPath(plane)
+    fold=QPainterPath(); fold.moveTo(9.7,13.9); fold.lineTo(17.7,7.4); fold.cubicTo(18.1,7.1,18.4,7.4,18,7.8); fold.lineTo(12.6,16.5)
+    painter.setBrush(Qt.NoBrush); painter.setPen(QColor('#2AABEE')); painter.drawPath(fold)
+    painter.end()
+    return pixmap
 
 def credentials():
     try: return int(os.environ['TG_API_ID']),os.environ['TG_API_HASH']
@@ -769,6 +783,7 @@ class Window(QMainWindow):
         super().__init__(); self.conn=database(); self.thread=None; self.profile_thread=None; self.proxy_test_thread=None
         self.profile_edit_thread=None
         self.update_thread=None
+        self.update_check_only=False; self.update_available=False; self.update_notice_shown=False
         self.chat_send_thread=None; self.chatlist_thread=None
         self.dialog_windows={}; self.dialog_connected_sessions=set(); self.account_unread_counts={}; self.account_unread_badges={}
         self.unread_poll_thread=None
@@ -777,6 +792,8 @@ class Window(QMainWindow):
         self.unread_timer=QTimer(self); self.unread_timer.setInterval(60000); self.unread_timer.timeout.connect(self.refresh_private_unread); self.unread_timer.start()
         QTimer.singleShot(1500,lambda:self.refresh_profiles(show_errors=False))
         QTimer.singleShot(4000,self.refresh_private_unread)
+        self.update_check_timer=QTimer(self); self.update_check_timer.setInterval(UPDATE_CHECK_INTERVAL_MS); self.update_check_timer.timeout.connect(self.check_for_updates); self.update_check_timer.start()
+        QTimer.singleShot(2500,self.check_for_updates)
     def heading(self,title,subtitle):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(0,0,0,18)
         a=QLabel(title); a.setObjectName('title'); b=QLabel(subtitle); b.setObjectName('muted'); l.addWidget(a); l.addWidget(b); return w
@@ -788,8 +805,18 @@ class Window(QMainWindow):
         if self.update_thread and self.update_thread.isRunning():
             self.status.setText('Проверка обновления уже выполняется.')
             return
+        self.update_check_only=False
         self.update_button.setEnabled(False)
         self.status.setText('Проверяю актуальную версию в GitHub...')
+        self.start_update_worker()
+
+    def check_for_updates(self):
+        if self.update_thread and self.update_thread.isRunning():
+            return
+        self.update_check_only=True
+        self.start_update_worker()
+
+    def start_update_worker(self):
         thread=QThread(self)
         worker=Worker(lambda:asyncio.to_thread(download_latest_app_update))
         self.update_thread=thread; self.update_worker=worker
@@ -806,23 +833,54 @@ class Window(QMainWindow):
         if self.update_thread is thread: self.update_thread=None
         thread.deleteLater()
 
-    def update_failed(self,error):
+    def update_failed(self,error,silent_check=False):
+        silent_check=silent_check or self.update_check_only
+        self.update_check_only=False
         self.update_button.setEnabled(True)
-        self.status.setText('Не удалось обновить приложение.')
-        QMessageBox.warning(self,'Обновление TG Manager',str(error))
+        self.status.setText('Не удалось проверить обновления.' if silent_check else 'Не удалось обновить приложение.')
+        if silent_check:
+            write_import_log(f'Не удалось проверить наличие обновлений: {error}')
+        else:
+            QMessageBox.warning(self,'Обновление TG Manager',str(error))
 
     def update_downloaded(self,result):
         commit_sha,source,icon_data=result
+        silent_check=self.update_check_only
+        self.update_check_only=False
         current_app=Path(__file__).resolve()
         current_icon=ROOT/'tg-manager.ico'
         try:
             if current_app.read_bytes()==source and current_icon.read_bytes()==icon_data:
                 self.update_button.setEnabled(True)
-                self.status.setText('Установлена последняя версия.')
-                QMessageBox.information(self,'Обновление TG Manager','Установлена последняя версия приложения.')
+                self.update_available=False
+                self.update_button.setText('⟳  Обновить версию')
+                self.update_button.setObjectName('')
+                self.update_button.setToolTip('')
+                self.update_button.style().unpolish(self.update_button)
+                self.update_button.style().polish(self.update_button)
+                if not silent_check:
+                    self.status.setText('Установлена последняя версия.')
+                    QMessageBox.information(self,'Обновление TG Manager','Установлена последняя версия приложения.')
                 return
         except OSError as error:
-            self.update_failed(f'Не удалось прочитать установленный app.py: {error}')
+            self.update_failed(f'Не удалось прочитать установленный app.py: {error}',silent_check=silent_check)
+            return
+        if silent_check:
+            self.update_available=True
+            self.update_button.setEnabled(True)
+            self.update_button.setText('⬆  Доступна новая версия')
+            self.update_button.setObjectName('primary')
+            self.update_button.setToolTip(f'Доступно обновление из GitHub ({commit_sha[:7]}). Нажмите, чтобы установить.')
+            self.update_button.style().unpolish(self.update_button)
+            self.update_button.style().polish(self.update_button)
+            self.status.setText('В GitHub доступна новая версия приложения.')
+            if not self.update_notice_shown:
+                self.update_notice_shown=True
+                QMessageBox.information(
+                    self,
+                    'Доступна новая версия TG Manager',
+                    f'В GitHub опубликовано обновление (коммит {commit_sha[:7]}). Нажмите «Доступна новая версия» в боковой панели, чтобы установить его.',
+                )
             return
         answer=QMessageBox.question(
             self,
@@ -868,7 +926,10 @@ class Window(QMainWindow):
     def build(self):
         root=QHBoxLayout(); root.setContentsMargins(0,0,0,0); root.setSpacing(0); container=QWidget(); container.setLayout(root)
         side=QFrame(); side.setObjectName('side'); side.setFixedWidth(245); sl=QVBoxLayout(side); sl.setContentsMargins(18,25,18,18)
-        brand=QLabel('◈  TG MANAGER'); brand.setObjectName('brand'); sl.addWidget(brand); sl.addSpacing(25)
+        brand=QWidget(); brand_layout=QHBoxLayout(brand); brand_layout.setContentsMargins(0,0,0,0); brand_layout.setSpacing(8)
+        brand_icon=QLabel(); brand_icon.setPixmap(telegram_mark_icon(24)); brand_layout.addWidget(brand_icon)
+        brand_text=QLabel('TG MANAGER'); brand_text.setObjectName('brand'); brand_layout.addWidget(brand_text); brand_layout.addStretch()
+        sl.addWidget(brand); sl.addSpacing(25)
         self.nav=QListWidget(); self.nav.addItems(['Обзор','Аккаунты','Чаты','Отправить сообщение']); self.nav.setObjectName('nav'); sl.addWidget(self.nav); sl.addStretch()
         api=QPushButton('⚙  Настройки API'); api.clicked.connect(self.api_settings); sl.addWidget(api)
         self.update_button=QPushButton('⟳  Обновить версию'); self.update_button.clicked.connect(self.update_application); sl.addWidget(self.update_button)
