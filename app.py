@@ -944,7 +944,7 @@ class Window(QMainWindow):
             b=QPushButton(text); b.setObjectName('action'); b.clicked.connect(lambda _,r=row:self.nav.setCurrentRow(r)); l.addWidget(b)
         l.addStretch(); return w
     def accounts_page(self):
-        w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); h=QHBoxLayout(); h.addWidget(self.heading('Аккаунты','Импортируйте профили Telegram Desktop; имя и фото загрузятся из Telegram')); refresh=QPushButton('⟳ Обновить профили'); refresh.clicked.connect(self.refresh_profiles); h.addWidget(refresh,0,Qt.AlignTop); b=QPushButton('＋ Импорт ZIP'); b.clicked.connect(self.import_zip); h.addWidget(b,0,Qt.AlignTop); folder=QPushButton('Импорт папки TDATA'); folder.clicked.connect(self.import_folder); h.addWidget(folder,0,Qt.AlignTop); l.addLayout(h); self.import_status=QLabel('Выберите ZIP-архив или папку tdata'); self.import_status.setObjectName('muted'); l.addWidget(self.import_status);         self.account_table=self.make_table(['Фото','Имя аккаунта','Username','Файл сессии','Статус','Профиль','Диалоги','Действия']); self.account_table.setIconSize(QPixmap(40,40).size()); l.addWidget(self.account_table); return w
+        w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); h=QHBoxLayout(); h.addWidget(self.heading('Аккаунты','Импортируйте профили Telegram Desktop; имя и статус обновляются из Telegram')); refresh=QPushButton('⟳ Обновить профили'); refresh.clicked.connect(self.refresh_profiles); h.addWidget(refresh,0,Qt.AlignTop); b=QPushButton('＋ Импорт ZIP'); b.clicked.connect(self.import_zip); h.addWidget(b,0,Qt.AlignTop); folder=QPushButton('Импорт папки TDATA'); folder.clicked.connect(self.import_folder); h.addWidget(folder,0,Qt.AlignTop); l.addLayout(h); self.import_status=QLabel('Выберите ZIP-архив или папку tdata'); self.import_status.setObjectName('muted'); l.addWidget(self.import_status);         self.account_table=self.make_table(['Фото','Имя аккаунта','Username','Файл сессии','Статус','Профиль','Диалоги','Действия']); self.account_table.setIconSize(QPixmap(40,40).size()); l.addWidget(self.account_table); return w
     def chats_page(self):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30)
         h=QHBoxLayout(); h.addWidget(self.heading('Чаты','Назначьте аккаунт каждому чату и отправляйте сообщения отдельно или всем списком')); self.chat_folder_button=QPushButton('＋ Импорт папки чатов'); self.chat_folder_button.clicked.connect(self.import_chat_folder); h.addWidget(self.chat_folder_button,0,Qt.AlignTop); b=QPushButton('＋ Добавить группу'); b.clicked.connect(self.add_chat); h.addWidget(b,0,Qt.AlignTop); self.chat_broadcast_button=QPushButton('Авторассылка'); self.chat_broadcast_button.setObjectName('primary'); self.chat_broadcast_button.setToolTip('Отправить сообщение по умолчанию во все сохранённые чаты'); self.chat_broadcast_button.clicked.connect(self.send_to_all_chats); h.addWidget(self.chat_broadcast_button,0,Qt.AlignTop); l.addLayout(h)
@@ -1442,7 +1442,7 @@ class Window(QMainWindow):
             self.import_status.setText(f'Не удалось подключиться для загрузки профилей: {error}')
             if show_errors: QMessageBox.warning(self,'Профили Telegram',str(error))
             return
-        self.import_status.setText('Подключаюсь к Telegram и загружаю имена и фото профилей...')
+        self.import_status.setText('Подключаюсь к Telegram и проверяю имя, username и статус аккаунтов...')
         self.profile_thread=QThread(self)
         self.profile_worker=Worker(lambda progress,item:self.load_profiles(accounts,api_id,api_hash,client_options,progress),with_progress=True)
         self.profile_worker.moveToThread(self.profile_thread)
@@ -1472,11 +1472,11 @@ class Window(QMainWindow):
             client=None
             result=None
             try:
-                client=TelegramClient(session_path,api_id,api_hash,timeout=8,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
+                client=TelegramClient(session_path,api_id,api_hash,timeout=12,connection_retries=3,request_retries=2,retry_delay=1,auto_reconnect=False,**client_options)
                 try:
-                    await asyncio.wait_for(client.connect(),timeout=12)
+                    await asyncio.wait_for(client.connect(),timeout=45)
                     if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: запрашиваю статус в Telegram...')
-                    user=await asyncio.wait_for(client.get_me(),timeout=20)
+                    user=await asyncio.wait_for(client.get_me(),timeout=30)
                 except asyncio.TimeoutError as error:
                     raise TimeoutError('Telegram не ответил вовремя. Проверьте подключение или прокси и повторите обновление профилей.') from error
                 if user is None:
@@ -1487,14 +1487,8 @@ class Window(QMainWindow):
                     first_name=user.first_name or ''
                     last_name=user.last_name or ''
                     username=user.username or ''
-                    avatar=None
-                    about=None
-                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: загружаю фото и сведения...')
-                    try:
-                        first_name,last_name,username,avatar,about=await asyncio.wait_for(telegram_profile_snapshot(client,user),timeout=12)
-                    except asyncio.TimeoutError:
-                        if progress: progress(f'Аккаунт {index}/{len(accounts)} подтверждён; фото и дополнительные сведения не загрузились вовремя.')
-                    result=(account_id,user.id,first_name,last_name,username,avatar,about,'','')
+                    if progress: progress(f'Аккаунт {index}/{len(accounts)} подтверждён; обновляю имя и username...')
+                    result=(account_id,user.id,first_name,last_name,username,None,None,'','')
             except Exception as error:
                 if account_issue_from_error(error)=='deleted':
                     result=(account_id,None,'','','','','','deleted','')
@@ -1546,8 +1540,8 @@ class Window(QMainWindow):
                 self.import_status.setText('; '.join(status_messages)+'.')
                 write_import_log('Результат проверки аккаунтов: '+'; '.join(status_messages))
             else:
-                self.import_status.setText('Имена и аватары профилей обновлены.')
-                write_import_log(f'Данные профилей Telegram обновлены: {len(results)}')
+                self.import_status.setText('Имена и username обновлены; сохранённые фото и описание не менялись.')
+                write_import_log(f'Имена и username профилей Telegram обновлены: {len(results)}')
         self.status.setText(self.import_status.text())
 
     def mark_account_issue(self,session,error,refresh=True):
