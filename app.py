@@ -292,6 +292,20 @@ async def prepare_telegram_client():
         await asyncio.to_thread(ensure_tgws_proxy)
     return telegram_client_options(proxy_mode=mode)
 
+async def connect_account_client(client,timeout=20):
+    try:
+        await asyncio.wait_for(client.connect(),timeout=timeout)
+        authorized=await asyncio.wait_for(client.is_user_authorized(),timeout=timeout)
+    except asyncio.TimeoutError as error:
+        raise TimeoutError(f'Telegram не ответил за {timeout} секунд. Проверьте Интернет и выбранный прокси.') from error
+    if not authorized:
+        raise RuntimeError('Сессия аккаунта не авторизована. Повторно импортируйте TDATA этого аккаунта.')
+
+def create_account_client(session,api_id,api_hash,**options):
+    client_options={'timeout':12,'connection_retries':1,'request_retries':1,'retry_delay':1}
+    client_options.update(options)
+    return TelegramClient(session,api_id,api_hash,**client_options)
+
 class Worker(QObject):
     done=Signal(object); error=Signal(str); progress=Signal(str); item=Signal(object)
     def __init__(self,fn,with_progress=False): super().__init__(); self.fn=fn; self.with_progress=with_progress
@@ -357,8 +371,8 @@ class DialogSessionWorker(QObject):
         try:
             self.status.emit('Подключаюсь к Telegram...')
             client_options=await prepare_telegram_client()
-            self.client=TelegramClient(self.session,self.api_id,self.api_hash,**client_options)
-            await self.client.start()
+            self.client=create_account_client(self.session,self.api_id,self.api_hash,**client_options)
+            await connect_account_client(self.client)
             self.connected.emit(self.session)
             self.client.add_event_handler(self._on_new_message,events.NewMessage(incoming=True))
             self.status.emit('Загружаю последние диалоги...')
@@ -1045,10 +1059,10 @@ class Window(QMainWindow):
     async def fetch_dialogs(self,api_id,api_hash,session,progress):
         from telethon.utils import get_peer_id
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             progress('Подключаю аккаунт и загружаю список диалогов...')
-            await client.start()
+            await connect_account_client(client)
             results=[]
             async for dialog in client.iter_dialogs():
                 entity=dialog.entity
@@ -1086,10 +1100,10 @@ class Window(QMainWindow):
 
     async def fetch_dialog_messages(self,api_id,api_hash,session,peer,progress):
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             progress('Подключаюсь к Telegram и загружаю историю...')
-            await client.start()
+            await connect_account_client(client)
             entity=await client.get_entity(int(peer))
             messages=await client.get_messages(entity,limit=100)
             lines=[]
@@ -1125,10 +1139,10 @@ class Window(QMainWindow):
 
     async def send_dialog_message_request(self,api_id,api_hash,session,peer,text,progress):
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             progress('Подключаюсь к Telegram и отправляю сообщение...')
-            await client.start()
+            await connect_account_client(client)
             entity=await client.get_entity(int(peer))
             await client.send_message(entity,text)
             messages=await client.get_messages(entity,limit=100)
@@ -1175,7 +1189,7 @@ class Window(QMainWindow):
             self.account_table.setItem(r,1,QTableWidgetItem(display_name))
             self.account_table.setItem(r,2,QTableWidgetItem(f'@{username}' if username else ''))
             self.account_table.setItem(r,3,QTableWidgetItem(Path(session).name))
-            status_labels={'deleted':'Аккаунт удалён — больше не действителен','invalid':'Сессия больше не действительна','banned':'Заблокирован Telegram','restricted':'Ограничен Telegram'}
+            status_labels={'deleted':'Аккаунт удалён — больше не действителен','invalid':'Сессия больше не действительна','banned':'Заблокирован Telegram','restricted':'Ограничен Telegram','connection_error':'Ошибка подключения'}
             status_item=QTableWidgetItem(status_labels.get(account_status,'● Профиль загружен' if first_name or username else 'Ожидает подключения'))
             if account_status in status_labels:
                 status_item.setForeground(QColor('#ff6b75'))
@@ -1183,7 +1197,8 @@ class Window(QMainWindow):
                     'Telegram пометил этот профиль как удалённый или больше не действительный.' if account_status=='deleted'
                     else 'Telegram отозвал или больше не принимает эту сессию.' if account_status=='invalid'
                     else 'Telegram сообщил о блокировке аккаунта.' if account_status=='banned'
-                    else 'Telegram ограничил отправку сообщений с этого аккаунта.'
+                    else 'Telegram ограничил отправку сообщений с этого аккаунта.' if account_status=='restricted'
+                    else 'Не удалось подключиться к Telegram. Нажмите «Обновить профили» и проверьте сообщение об ошибке ниже.'
                 )
             self.account_table.setItem(r,4,status_item)
             edit_button=QPushButton('✎ Изменить профиль Telegram')
@@ -1586,13 +1601,14 @@ class Window(QMainWindow):
             client=None
             result=None
             try:
-                client=TelegramClient(session_path,api_id,api_hash,timeout=12,connection_retries=3,request_retries=2,retry_delay=1,auto_reconnect=False,**client_options)
+                client=create_account_client(session_path,api_id,api_hash,auto_reconnect=False,**client_options)
                 try:
-                    await asyncio.wait_for(client.connect(),timeout=45)
-                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: запрашиваю статус в Telegram...')
-                    user=await asyncio.wait_for(client.get_me(),timeout=30)
+                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: подключаюсь и проверяю авторизацию...')
+                    await connect_account_client(client,timeout=15)
+                    if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: получаю данные профиля...')
+                    user=await asyncio.wait_for(client.get_me(),timeout=15)
                 except asyncio.TimeoutError as error:
-                    raise TimeoutError('Telegram не ответил вовремя. Проверьте подключение или прокси и повторите обновление профилей.') from error
+                    raise TimeoutError('Telegram не ответил за 15 секунд. Проверьте подключение к Интернету и способ прокси.') from error
                 if user is None:
                     result=(account_id,None,'','','','','','invalid','')
                 elif getattr(user,'deleted',False):
@@ -1608,12 +1624,14 @@ class Window(QMainWindow):
                     result=(account_id,None,'','','','','','deleted','')
                 elif account_issue_from_error(error)=='invalid':
                     result=(account_id,None,'','','','','','invalid','')
+                elif 'Сессия аккаунта не авторизована' in str(error):
+                    result=(account_id,None,'','','','','','invalid','')
                 else:
                     result=(account_id,None,'','','','','','',f'{type(error).__name__}: {error}')
             finally:
                 if client is not None:
                     try:
-                        await asyncio.wait_for(client.disconnect(),timeout=10)
+                        await asyncio.wait_for(client.disconnect(),timeout=3)
                     except Exception as error:
                         if result is None:
                             result=(account_id,None,'','','','','','',f'Не удалось закрыть соединение с Telegram: {type(error).__name__}: {error}')
@@ -1626,9 +1644,12 @@ class Window(QMainWindow):
         invalid_accounts=[]
         for account_id,telegram_id,first_name,last_name,username,avatar,about,account_status,error in results:
             if error:
-                errors.append(error)
                 session_row=self.conn.execute('SELECT session FROM accounts WHERE id=?',(account_id,)).fetchone()
-                if session_row: self.mark_account_issue(session_row[0],error,refresh=False)
+                account_row=self.conn.execute('SELECT name FROM accounts WHERE id=?',(account_id,)).fetchone()
+                account_name=account_row[0] if account_row else f'ID {account_id}'
+                errors.append(f'{account_name}: {error}')
+                if session_row and not self.mark_account_issue(session_row[0],error,refresh=False):
+                    self.conn.execute('UPDATE accounts SET account_status=? WHERE id=? AND account_status NOT IN (\'deleted\',\'invalid\',\'banned\',\'restricted\')',('connection_error',account_id))
                 continue
             if account_status in ('deleted','invalid'):
                 self.conn.execute('UPDATE accounts SET telegram_id=?,account_status=? WHERE id=?',(telegram_id,account_status,account_id))
@@ -1817,9 +1838,9 @@ class Window(QMainWindow):
         results={}; account_issues=[]
         options=await prepare_telegram_client()
         for session in sessions:
-            client=TelegramClient(session,api_id,api_hash,**options)
+            client=create_account_client(session,api_id,api_hash,**options)
             try:
-                await client.start()
+                await connect_account_client(client)
                 unread=0
                 async for dialog in client.iter_dialogs(limit=100):
                     if isinstance(dialog.entity,User) and not dialog.entity.bot:
@@ -1938,10 +1959,10 @@ class Window(QMainWindow):
         from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
         from telethon.tl.functions.photos import UploadProfilePhotoRequest
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         updated=[]
         try:
-            await client.start()
+            await connect_account_client(client)
             try:
                 if photo_path:
                     uploaded=await client.upload_file(photo_path)
@@ -2064,10 +2085,10 @@ class Window(QMainWindow):
         from telethon.utils import get_peer_id
         progress('Подготавливаю соединение с Telegram...')
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             progress('Подключаю аккаунт к Telegram...')
-            await client.start()
+            await connect_account_client(client)
             progress('Проверяю ссылку и содержимое папки...')
             invite=await client(CheckChatlistInviteRequest(slug))
             if isinstance(invite,ChatlistInvite):
@@ -2186,10 +2207,10 @@ class Window(QMainWindow):
         from telethon.tl.types import Chat, Channel
         from telethon.utils import get_peer_id
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             try:
-                await client.start()
+                await connect_account_client(client)
             except Exception as error:
                 if account_issue_from_error(error)=='banned':
                     raise RuntimeError('ACCOUNT_BANNED: Telegram сообщил, что этот аккаунт заблокирован или деактивирован.') from error
@@ -2364,10 +2385,10 @@ class Window(QMainWindow):
         from telethon.tl.functions.channels import JoinChannelRequest
         from telethon.tl.types import Channel
         client_options=await prepare_telegram_client()
-        client=TelegramClient(session,api_id,api_hash,**client_options)
+        client=create_account_client(session,api_id,api_hash,**client_options)
         try:
             try:
-                await client.start()
+                await connect_account_client(client)
             except Exception as error:
                 if account_issue_from_error(error)=='banned': 
                     raise RuntimeError('ACCOUNT_BANNED: Telegram сообщил, что этот аккаунт заблокирован или деактивирован.') from error
