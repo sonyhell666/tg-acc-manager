@@ -67,38 +67,45 @@ def download_latest_app_update():
     if not re.fullmatch(r'[0-9a-f]{40}',commit_sha):
         raise RuntimeError('GitHub вернул некорректный идентификатор версии.')
 
-    source_url=f'https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{commit_sha}/github-update/app.py'
-    try:
-        request=urllib.request.Request(source_url,headers={'User-Agent':'TG-Manager-Updater'})
-        with urllib.request.urlopen(request,timeout=30) as response:
-            source=response.read(4*1024*1024+1)
-    except urllib.error.HTTPError as error:
-        if error.code==404:
-            raise RuntimeError(f'В папке github-update коммита {commit_sha[:7]} не найден app.py. Обновление не установлено.') from error
-        raise RuntimeError(f'Не удалось скачать новую версию с GitHub (HTTP {error.code}).') from error
-    except OSError as error:
-        raise RuntimeError(f'Не удалось скачать новую версию с GitHub: {error}') from error
-    if len(source)>4*1024*1024:
-        raise RuntimeError('Файл обновления слишком большой; приложение оставлено без изменений.')
+    def download_asset(path,limit,description):
+        url=f'https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{commit_sha}/{path}'
+        try:
+            request=urllib.request.Request(url,headers={'User-Agent':'TG-Manager-Updater'})
+            with urllib.request.urlopen(request,timeout=30) as response:
+                data=response.read(limit+1)
+        except urllib.error.HTTPError as error:
+            if error.code==404: return None
+            raise RuntimeError(f'Не удалось скачать {description} с GitHub (HTTP {error.code}).') from error
+        except OSError as error:
+            raise RuntimeError(f'Не удалось скачать {description} с GitHub: {error}') from error
+        if len(data)>limit:
+            raise RuntimeError(f'Файл {description} слишком большой; приложение оставлено без изменений.')
+        return data
+
+    source=None
+    icon_data=None
+    source_found=False
+    for prefix in ('','github-update/'):
+        candidate_source=download_asset(f'{prefix}app.py',4*1024*1024,'app.py')
+        if candidate_source is None: continue
+        source_found=True
+        candidate_icon=download_asset(f'{prefix}tg-manager.ico',5*1024*1024,'иконку')
+        if candidate_icon is None: continue
+        source=candidate_source
+        icon_data=candidate_icon
+        break
+    if source is None:
+        if source_found:
+            raise RuntimeError('Для найденного app.py не найден tg-manager.ico рядом с ним ни в корне репозитория, ни в папке github-update. Обновление не установлено.')
+        raise RuntimeError('В корне репозитория и в папке github-update не найден app.py. Обновление не установлено.')
     try:
         source_text=source.decode('utf-8')
         compile(source_text,'app.py','exec')
     except (UnicodeError,SyntaxError) as error:
         raise RuntimeError(f'Файл app.py из GitHub не прошёл проверку и не будет установлен: {error}') from error
     if 'class Window(QMainWindow)' not in source_text or "if __name__=='__main__':" not in source_text:
-        raise RuntimeError('В GitHub/github-update найден файл app.py, но его структура не похожа на TG Manager. Обновление отменено.')
-    icon_url=f'https://raw.githubusercontent.com/{UPDATE_REPOSITORY}/{commit_sha}/github-update/tg-manager.ico'
-    try:
-        request=urllib.request.Request(icon_url,headers={'User-Agent':'TG-Manager-Updater'})
-        with urllib.request.urlopen(request,timeout=30) as response:
-            icon_data=response.read(5*1024*1024+1)
-    except urllib.error.HTTPError as error:
-        if error.code==404:
-            raise RuntimeError(f'В папке github-update коммита {commit_sha[:7]} не найден tg-manager.ico. Загрузите обновлённую папку github-update.') from error
-        raise RuntimeError(f'Не удалось скачать иконку из GitHub (HTTP {error.code}).') from error
-    except OSError as error:
-        raise RuntimeError(f'Не удалось скачать иконку из GitHub: {error}') from error
-    if len(icon_data)>5*1024*1024 or len(icon_data)<22 or icon_data[:4]!=b'\x00\x00\x01\x00':
+        raise RuntimeError('Найденный в GitHub app.py не похож на TG Manager. Обновление отменено.')
+    if len(icon_data)<22 or icon_data[:4]!=b'\x00\x00\x01\x00':
         raise RuntimeError('Файл tg-manager.ico из GitHub повреждён или имеет неподдерживаемый формат.')
     return commit_sha,source,icon_data
 
