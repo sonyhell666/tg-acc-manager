@@ -172,13 +172,23 @@ def spam_restriction_notice(error):
     return ''
 
 def flood_wait_notice(error):
+    seconds=flood_wait_seconds(error)
+    if seconds is not None:
+        return f'Telegram временно ограничил отправку. Подождите {seconds} секунд и повторите попытку.'
     description=f'{type(error).__name__}: {error}'.upper()
     if 'FLOODWAITERROR' not in description and 'FLOOD_WAIT' not in description:
         return ''
-    match=re.search(r'(?:WAIT OF|FLOOD_WAIT_)\s*(\d+)',description)
-    if match:
-        return f'Telegram временно ограничил отправку. Подождите {match.group(1)} секунд и повторите попытку.'
     return 'Telegram временно ограничил отправку. Подождите и повторите попытку позже.'
+
+def flood_wait_seconds(error):
+    seconds=getattr(error,'seconds',None)
+    if isinstance(seconds,int) and seconds>=0:
+        return seconds
+    description=f'{type(error).__name__}: {error}'.upper()
+    if 'FLOODWAITERROR' not in description and 'FLOOD_WAIT' not in description:
+        return None
+    match=re.search(r'(?:WAIT OF|FLOOD_WAIT_)\s*(\d+)',description)
+    return int(match.group(1)) if match else None
 
 def round_robin_chat_assignments(chat_ids,account_sessions):
     if not account_sessions:
@@ -2667,7 +2677,7 @@ class Window(QMainWindow):
         thread.finished.connect(lambda finished=thread:self.chat_send_thread_finished(finished))
         thread.start()
     async def do_broadcast(self,api_id,api_hash,text,recipients,progress=None):
-        sent=[]; failures=[]
+        sent=[]; failures=[]; flood_wait=None
         total=len(recipients)
         for index,(title,peer,session,join_peer) in enumerate(recipients,1):
             if progress:
@@ -2676,10 +2686,16 @@ class Window(QMainWindow):
                 await self.do_send(api_id,api_hash,session,peer,text,join_peer)
                 sent.append(title)
             except Exception as error:
-                failures.append((title,visible_error_message(error),session))
+                message=visible_error_message(error)
+                failures.append((title,message,session))
+                seconds=flood_wait_seconds(error)
+                if seconds is not None:
+                    flood_wait=(title,seconds)
             if progress:
                 progress((index,total,title,len(sent),len(failures),True))
-        return sent,failures
+            if flood_wait is not None:
+                break
+        return sent,failures,flood_wait
     def chat_broadcast_progress(self,event):
         current,total,title,sent_count,failed_count,finished=event
         completed=current if finished else current-1
@@ -2688,9 +2704,18 @@ class Window(QMainWindow):
         state='Обработано' if finished else 'Отправляю'
         self.chat_status.setText(f'Авторассылка: {state} {current} из {total} — «{title}». Успешно: {sent_count}, ошибки: {failed_count}.')
     def chat_broadcast_finished(self,result,total):
-        sent,failures=result
+        sent,failures,flood_wait=result
         self.chat_progress.hide()
-        self.chat_status.setText(f'Авторассылка завершена: успешно отправлено в {len(sent)} из {total} чатов.')
+        processed=len(sent)+len(failures)
+        if flood_wait:
+            title,seconds=flood_wait
+            remaining=total-processed
+            self.chat_status.setText(
+                f'Авторассылка остановлена по ограничению Telegram на чате «{title}». '
+                f'Успешно: {len(sent)} из {total}; не обработано: {remaining}.'
+            )
+        else:
+            self.chat_status.setText(f'Авторассылка завершена: успешно отправлено в {len(sent)} из {total} чатов.')
         if failures:
             for _,error,session in failures:
                 self.mark_account_issue(session,error,refresh=False)
@@ -2701,7 +2726,18 @@ class Window(QMainWindow):
             if restricted:
                 details+='\n\nTelegram сообщил об ограничении аккаунта, связанном со спамом. '
                 details+='Аккаунт помечен как «Ограничен Telegram»; проверьте подробности в @SpamBot.'
-            QMessageBox.warning(self,'Авторассылка завершена',f'Успешно: {len(sent)} из {total}.\n\nНе удалось отправить:\n{details}')
+            if flood_wait:
+                title,seconds=flood_wait
+                remaining=total-processed
+                details+=(
+                    f'\n\nTelegram установил FloodWait при обработке «{title}»: подождите {seconds} секунд. '
+                    f'Авторассылка остановлена; оставшиеся {remaining} чатов не запускались. '
+                    'После ожидания проверьте ограничения в Telegram и запустите оставшуюся рассылку отдельно.'
+                )
+                message_title='Авторассылка остановлена: FloodWait'
+            else:
+                message_title='Авторассылка завершена'
+            QMessageBox.warning(self,message_title,f'Успешно: {len(sent)} из {total}.\n\nНе удалось отправить:\n{details}')
         else:
             QMessageBox.information(self,'Авторассылка завершена',f'Сообщение отправлено во все {total} чатов.')
     def chat_broadcast_failed(self,error):
@@ -2717,6 +2753,8 @@ class Window(QMainWindow):
             lower=message.lower()
             if notice:
                 message=notice
+            elif flood_wait_notice(message):
+                message=flood_wait_notice(message)
             elif 'connection to telegram failed' in lower:
                 message+=' Проверьте подключение к Интернету или прокси.'
             elif 'you can\'t write in this chat' in lower or 'sendmessagerequest' in lower:
@@ -2742,6 +2780,12 @@ class Window(QMainWindow):
             QMessageBox.warning(self,'Ограничение аккаунта Telegram',notice)
             self.thread.quit()
             return
+        flood_notice=flood_wait_notice(e)
+        if flood_notice:
+            self.status.setText(flood_notice)
+            QMessageBox.warning(self,'Временное ограничение Telegram',flood_notice)
+            self.thread.quit()
+            return
         message=str(e)
         lower=message.lower()
         if 'connection to telegram failed' in lower:
@@ -2752,7 +2796,7 @@ class Window(QMainWindow):
             message='Telegram временно ограничил отправку сообщений. Подождите несколько минут и попробуйте снова.'
         self.status.setText('Ошибка операции'); QMessageBox.critical(self,'Ошибка Telegram',message); self.thread.quit()
     async def do_send(self,api_id,api_hash,session,peer,text,join_peer=''):
-        from telethon.errors import BroadcastForbiddenError, ChannelPrivateError, ChatWriteForbiddenError, FloodWaitError, UserAlreadyParticipantError, UserBannedInChannelError
+        from telethon.errors import BroadcastForbiddenError, ChannelPrivateError, ChatWriteForbiddenError, UserAlreadyParticipantError, UserBannedInChannelError
         from telethon.tl.functions.channels import JoinChannelRequest
         from telethon.tl.types import Channel
         client_options=await prepare_telegram_client()
@@ -2789,8 +2833,6 @@ class Window(QMainWindow):
                 await telegram_call(client.send_message(target,text),'отправка сообщения')
             except (ChatWriteForbiddenError,BroadcastForbiddenError,ChannelPrivateError,UserBannedInChannelError) as exc:
                 raise RuntimeError('Нельзя отправлять сообщения в этот чат. Проверьте, что аккаунт состоит в чате и имеет права на отправку сообщений; для каналов это обычно доступно только администратору.') from exc
-            except FloodWaitError as exc:
-                raise RuntimeError(f'Telegram временно ограничил отправку сообщений. Подождите {exc.seconds} секунд и попробуйте снова.') from exc
             write_import_log(f'Сообщение успешно отправлено аккаунтом {Path(session).name} в чат {peer}.')
             return True
         finally:
