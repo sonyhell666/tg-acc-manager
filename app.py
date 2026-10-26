@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio, base64, hashlib, html, json, os, re, shutil, socket, sqlite3, subprocess, sys, tempfile, time, zipfile
+from datetime import datetime
 import urllib.error, urllib.request
 from pathlib import Path
 from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl, QEvent
@@ -21,12 +22,36 @@ UPDATE_BRANCH='main'
 UPDATE_CHECK_INTERVAL_MS=6*60*60*1000
 DATA.mkdir(parents=True,exist_ok=True); SESSIONS.mkdir(parents=True,exist_ok=True)
 _LOCAL_PROXY_PROCESS=None
-try: LOG.write_text('TG Manager app.py запущен\n',encoding='utf-8')
-except Exception: pass
+
+def sanitize_log_text(message):
+    text=str(message)
+    secrets={os.environ.get('TG_API_HASH',''),os.environ.get('TG_PROXY','')}
+    try:
+        settings=json.loads(SETTINGS.read_text(encoding='utf-8')) if SETTINGS.exists() else {}
+        secrets.update((str(settings.get(key,'')) for key in ('api_hash','proxy')))
+    except (OSError,json.JSONDecodeError,TypeError):
+        pass
+    for secret in secrets:
+        if len(secret)>=6:
+            text=text.replace(secret,'[скрыто]')
+    text=re.sub(r'(?i)(socks5h?|https?)://([^:/@\s]+):([^@\s]+)@',r'\1://[скрыто]@',text)
+    home=str(Path.home())
+    if home:
+        text=re.sub(re.escape(home), '[папка пользователя]', text, flags=re.IGNORECASE)
+    return text
 
 def write_import_log(message):
-    try: LOG.write_text(message+'\n',encoding='utf-8')
-    except Exception: pass
+    text=sanitize_log_text(message)
+    line=f'[{datetime.now().astimezone().isoformat(timespec="seconds")}] {text}\n'
+    try:
+        if LOG.exists() and LOG.stat().st_size>=2*1024*1024:
+            backup=LOG.with_suffix(LOG.suffix+'.1')
+            backup.unlink(missing_ok=True)
+            LOG.replace(backup)
+        with LOG.open('a',encoding='utf-8') as log_file:
+            log_file.write(line)
+    except OSError as error:
+        print(f'Не удалось записать журнал приложения: {error}',file=sys.stderr)
 
 def database():
     c=sqlite3.connect(DB)
@@ -1003,11 +1028,51 @@ class Window(QMainWindow):
         sl.addWidget(brand); sl.addSpacing(25)
         self.nav=QListWidget(); self.nav.addItems(['Обзор','Аккаунты','Чаты','Отправить сообщение']); self.nav.setObjectName('nav'); sl.addWidget(self.nav); sl.addStretch()
         api=QPushButton('⚙  Настройки API'); api.clicked.connect(self.api_settings); sl.addWidget(api)
+        self.logs_button=QPushButton('▤  Логи'); self.logs_button.setMaximumHeight(30); self.logs_button.setStyleSheet('text-align:left;padding:5px 10px;color:#8c99ad;font-size:11px;'); self.logs_button.clicked.connect(self.show_logs); sl.addWidget(self.logs_button)
         self.update_button=QPushButton('⟳  Обновить версию'); self.update_button.clicked.connect(self.update_application); sl.addWidget(self.update_button)
         exit_button=QPushButton('⏻  Выход'); exit_button.clicked.connect(QApplication.quit); sl.addWidget(exit_button)
         sl.addWidget(QLabel('Локальное управление\nTelegram-аккаунтами'))
         self.pages=QStackedWidget(); self.pages.addWidget(self.dashboard()); self.pages.addWidget(self.accounts_page()); self.pages.addWidget(self.chats_page()); self.pages.addWidget(self.send_page()); self.nav.currentRowChanged.connect(self.pages.setCurrentIndex)
         root.addWidget(side); root.addWidget(self.pages); self.setCentralWidget(container); self.nav.setCurrentRow(0)
+        write_import_log('TG Manager запущен')
+
+    def show_logs(self):
+        dialog=QDialog(self); dialog.setWindowTitle('Журнал приложения'); dialog.resize(850,560)
+        layout=QVBoxLayout(dialog)
+        note=QLabel('Здесь отображаются события и ошибки приложения. API Hash и пароль прокси маскируются; перед отправкой журнала всё равно проверьте его содержимое.')
+        note.setWordWrap(True); note.setObjectName('muted'); layout.addWidget(note)
+        log_view=QPlainTextEdit(); log_view.setReadOnly(True); log_view.setLineWrapMode(QPlainTextEdit.NoWrap); layout.addWidget(log_view,1)
+        buttons=QHBoxLayout()
+        refresh_button=QPushButton('Обновить'); copy_button=QPushButton('Копировать все логи'); close_button=QPushButton('Закрыть')
+        buttons.addWidget(refresh_button); buttons.addStretch(); buttons.addWidget(copy_button); buttons.addWidget(close_button); layout.addLayout(buttons)
+
+        def load_logs():
+            entries=[]
+            for path in (LOG.with_suffix(LOG.suffix+'.1'),LOG):
+                if not path.exists(): continue
+                try:
+                    entries.append(sanitize_log_text(path.read_text(encoding='utf-8')))
+                except (OSError,UnicodeError) as error:
+                    QMessageBox.warning(dialog,'Журнал приложения',f'Не удалось прочитать {path.name}: {error}')
+                    return
+            content=''.join(entries).strip()
+            log_view.setPlainText(content or 'Записей пока нет.')
+            log_view.verticalScrollBar().setValue(log_view.verticalScrollBar().maximum())
+
+        def copy_logs():
+            content=log_view.toPlainText()
+            if not content or content=='Записей пока нет.':
+                QMessageBox.information(dialog,'Журнал приложения','Пока нечего копировать.')
+                return
+            QApplication.clipboard().setText(content)
+            copy_button.setText('Скопировано')
+            QTimer.singleShot(1800,lambda:copy_button.setText('Копировать все логи'))
+
+        refresh_button.clicked.connect(load_logs)
+        copy_button.clicked.connect(copy_logs)
+        close_button.clicked.connect(dialog.accept)
+        load_logs()
+        dialog.exec()
     def dashboard(self):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); l.addWidget(self.heading('Добро пожаловать','Управляйте своими аккаунтами и отправляйте сообщения вручную'))
         g=QGridLayout(); self.accounts_metric=self.create_metric('Аккаунты'); self.chats_metric=self.create_metric('Чаты'); g.addWidget(self.accounts_metric,0,0); g.addWidget(self.chats_metric,0,1); g.addWidget(self.create_metric('Режим'),0,2); l.addLayout(g); l.addSpacing(24); l.addWidget(QLabel('Быстрые действия'))
@@ -1423,6 +1488,7 @@ class Window(QMainWindow):
         os.environ['TG_PROXY_MODE']=proxy_mode
         if proxy_url: os.environ['TG_PROXY']=proxy_url
         else: os.environ.pop('TG_PROXY',None)
+        write_import_log(f'Сохранены настройки подключения: режим {proxy_mode}.')
         self.status.setText('Настройки подключения сохранены: '+('без прокси' if proxy_mode=='none' else 'локальный прокси' if proxy_mode=='local' else 'пользовательский прокси'))
         if self.conn.execute('SELECT 1 FROM accounts LIMIT 1').fetchone(): self.refresh_profiles()
 
@@ -1993,6 +2059,7 @@ class Window(QMainWindow):
         client=create_account_client(session,api_id,api_hash,**client_options)
         updated=[]
         try:
+            write_import_log(f'Начато изменение профиля аккаунта {Path(session).name}.')
             await connect_account_client(client)
             try:
                 if photo_path:
@@ -2029,6 +2096,7 @@ class Window(QMainWindow):
             user=await telegram_call(client.get_me(),'получение обновлённого профиля')
             if user is None: raise RuntimeError('Telegram не вернул данные обновлённого профиля.')
             first_name,last_name,username,avatar,updated_about=await telegram_profile_snapshot(client,user)
+            write_import_log(f'Профиль аккаунта {Path(session).name} обновлён: {", ".join(updated) or "данные профиля"}.')
             return account_id,user.id,first_name,last_name,username,avatar,updated_about,updated
         finally:
             await disconnect_account_client(client)
@@ -2420,6 +2488,7 @@ class Window(QMainWindow):
         client_options=await prepare_telegram_client()
         client=create_account_client(session,api_id,api_hash,**client_options)
         try:
+            write_import_log(f'Начата отправка сообщения аккаунтом {Path(session).name} в чат {peer}.')
             try:
                 await connect_account_client(client)
             except Exception as error:
@@ -2452,6 +2521,7 @@ class Window(QMainWindow):
                 raise RuntimeError('Нельзя отправлять сообщения в этот чат. Проверьте, что аккаунт состоит в чате и имеет права на отправку сообщений; для каналов это обычно доступно только администратору.') from exc
             except FloodWaitError as exc:
                 raise RuntimeError(f'Telegram временно ограничил отправку сообщений. Подождите {exc.seconds} секунд и попробуйте снова.') from exc
+            write_import_log(f'Сообщение успешно отправлено аккаунтом {Path(session).name} в чат {peer}.')
             return True
         finally:
             await disconnect_account_client(client)
