@@ -185,6 +185,14 @@ def round_robin_chat_assignments(chat_ids,account_sessions):
         return []
     return [(chat_id,account_sessions[index % len(account_sessions)]) for index,chat_id in enumerate(chat_ids)]
 
+def profile_photo_deletion_batches(photos,batch_size=100):
+    from telethon.tl.types import InputPhoto
+    old_photos=[
+        InputPhoto(id=photo.id,access_hash=photo.access_hash,file_reference=photo.file_reference)
+        for photo in photos[1:]
+    ]
+    return [old_photos[index:index+batch_size] for index in range(0,len(old_photos),batch_size)]
+
 async def telegram_profile_snapshot(client,user):
     from telethon.tl.functions.users import GetFullUserRequest
     full=await telegram_call(client(GetFullUserRequest(user)),'получение данных профиля',timeout=20)
@@ -1241,7 +1249,7 @@ class Window(QMainWindow):
             b=QPushButton(text); b.setObjectName('action'); b.clicked.connect(lambda _,r=row:self.nav.setCurrentRow(r)); l.addWidget(b)
         l.addStretch(); return w
     def accounts_page(self):
-        w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); h=QHBoxLayout(); h.addWidget(self.heading('Аккаунты','Импортируйте профили Telegram Desktop; имя и статус обновляются из Telegram')); refresh=QPushButton('⟳ Обновить профили'); refresh.clicked.connect(self.refresh_profiles); h.addWidget(refresh,0,Qt.AlignTop); b=QPushButton('＋ Импорт ZIP'); b.clicked.connect(self.import_zip); h.addWidget(b,0,Qt.AlignTop); folder=QPushButton('Импорт папки TDATA'); folder.clicked.connect(self.import_folder); h.addWidget(folder,0,Qt.AlignTop); l.addLayout(h); self.import_status=QLabel('Выберите ZIP-архив или папку tdata'); self.import_status.setObjectName('muted'); l.addWidget(self.import_status);         self.account_table=self.make_table(['Фото','Имя аккаунта','Username','Файл сессии','Статус','Профиль','Диалоги','Действия']); self.account_table.setIconSize(QPixmap(40,40).size()); l.addWidget(self.account_table); return w
+        w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30); h=QHBoxLayout(); h.addWidget(self.heading('Аккаунты','Импортируйте профили Telegram Desktop; имя и статус обновляются из Telegram')); refresh=QPushButton('⟳ Обновить профили'); refresh.clicked.connect(self.refresh_profiles); h.addWidget(refresh,0,Qt.AlignTop); b=QPushButton('＋ Импорт ZIP'); b.clicked.connect(self.import_zip); h.addWidget(b,0,Qt.AlignTop); folder=QPushButton('Импорт папки TDATA'); folder.clicked.connect(self.import_folder); h.addWidget(folder,0,Qt.AlignTop); l.addLayout(h); self.import_status=QLabel('Выберите ZIP-архив или папку tdata'); self.import_status.setObjectName('muted'); l.addWidget(self.import_status);         self.account_table=self.make_table(['Фото','Имя аккаунта','Username','Файл сессии','Статус','Профиль','Диалоги','Действия']); self.account_table.setIconSize(QPixmap(40,40).size()); self.account_table.horizontalHeader().setSectionResizeMode(5,QHeaderView.ResizeToContents); l.addWidget(self.account_table); return w
     def chats_page(self):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(34,30,34,30)
         h=QHBoxLayout(); h.addWidget(self.heading('Чаты','Назначьте аккаунт каждому чату и отправляйте сообщения отдельно или всем списком')); self.chat_folder_button=QPushButton('＋ Импорт папки чатов'); self.chat_folder_button.clicked.connect(self.import_chat_folder); h.addWidget(self.chat_folder_button,0,Qt.AlignTop); b=QPushButton('＋ Добавить группу'); b.clicked.connect(self.add_chat); h.addWidget(b,0,Qt.AlignTop); self.chat_auto_assign_button=QPushButton('Автораспределить аккаунты'); self.chat_auto_assign_button.setToolTip('Равномерно распределить добавленные аккаунты по всем чатам; текущие назначения будут заменены'); self.chat_auto_assign_button.clicked.connect(self.auto_assign_chat_accounts); h.addWidget(self.chat_auto_assign_button,0,Qt.AlignTop); self.chat_broadcast_button=QPushButton('Авторассылка'); self.chat_broadcast_button.setObjectName('primary'); self.chat_broadcast_button.setToolTip('Отправить сообщение по умолчанию во все сохранённые чаты'); self.chat_broadcast_button.clicked.connect(self.send_to_all_chats); h.addWidget(self.chat_broadcast_button,0,Qt.AlignTop); l.addLayout(h)
@@ -1458,7 +1466,9 @@ class Window(QMainWindow):
                     else 'Не удалось подключиться к Telegram. Нажмите «Обновить профили» и проверьте сообщение об ошибке ниже.'
                 )
             self.account_table.setItem(r,4,status_item)
-            edit_button=QPushButton('✎ Изменить профиль Telegram')
+            edit_button=QPushButton('Изменить профиль')
+            edit_button.setMinimumWidth(158)
+            edit_button.setToolTip('Изменить профиль Telegram')
             edit_button.clicked.connect(lambda _,ident=account_id,account_session=session:self.edit_account_profile(ident,account_session))
             self.account_table.setCellWidget(r,5,edit_button)
             dialogs_button=QPushButton('Диалоги')
@@ -2164,7 +2174,7 @@ class Window(QMainWindow):
         thread.deleteLater()
 
     def show_profile_editor(self,account_id,session,name,current_first_name,current_last_name,current_avatar,current_about,current_username=''):
-        dialog=QDialog(self); dialog.setWindowTitle(f'Изменить профиль Telegram — {name}'); dialog.resize(540,600)
+        dialog=QDialog(self); dialog.setWindowTitle(f'Изменить профиль Telegram — {name}'); dialog.resize(540,640)
         layout=QVBoxLayout(dialog); form=QFormLayout()
         first_name=QLineEdit(current_first_name)
         first_name.setPlaceholderText('Имя, которое увидят в Telegram')
@@ -2176,6 +2186,9 @@ class Window(QMainWindow):
         current_photo.setFixedSize(112,112); current_photo.setAlignment(Qt.AlignCenter); current_photo.setObjectName('panel')
         self.set_profile_preview(current_photo,current_avatar,'Нет текущей аватарки')
         form.addRow('Текущая аватарка',current_photo)
+        delete_old_photos=QCheckBox('Удалить предыдущие аватарки (оставить текущую)')
+        delete_old_photos.setToolTip('Удалит историю старых фото профиля в Telegram. Текущая аватарка останется.')
+        form.addRow('',delete_old_photos)
         photo_row=QWidget(); photo_layout=QHBoxLayout(photo_row); photo_layout.setContentsMargins(0,0,0,0)
         photo_path=QLineEdit(); photo_path.setReadOnly(True); photo_path.setPlaceholderText('Не выбрано — аватар не изменится')
         new_photo_preview=QLabel('Новое фото не выбрано'); new_photo_preview.setFixedSize(72,72); new_photo_preview.setAlignment(Qt.AlignCenter); new_photo_preview.setObjectName('panel')
@@ -2195,7 +2208,7 @@ class Window(QMainWindow):
         clear_about=QCheckBox('Очистить описание')
         clear_about.toggled.connect(lambda checked:about.setEnabled(not checked)); form.addRow('',clear_about)
         layout.addLayout(form)
-        note=QLabel('Имя, фамилия, username, описание и аватарка изменяются в самом Telegram.')
+        note=QLabel('Изменения профиля и удаление старых аватарок применяются в самом Telegram.')
         note.setObjectName('muted'); layout.addWidget(note)
         buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
@@ -2208,7 +2221,18 @@ class Window(QMainWindow):
         should_update_name=first_name_text!=current_first_name or last_name_text!=current_last_name
         should_update_username=(clear_username.isChecked() and bool(current_username)) or username_text!=current_username
         should_update_about=clear_about.isChecked() or about_text!=current_about
-        if not selected_photo and not should_update_name and not should_update_about and not should_update_username: return
+        should_delete_old_photos=delete_old_photos.isChecked()
+        if not selected_photo and not should_update_name and not should_update_about and not should_update_username and not should_delete_old_photos: return
+        if should_delete_old_photos:
+            answer=QMessageBox.question(
+                self,
+                'Удалить предыдущие аватарки',
+                'Удалить из Telegram все старые аватарки, оставив текущую? Это действие нельзя отменить.',
+                QMessageBox.Yes|QMessageBox.No,
+                QMessageBox.No,
+            )
+            if answer!=QMessageBox.Yes:
+                return
         if should_update_name and not first_name_text:
             QMessageBox.warning(self,'Имя Telegram','Имя в Telegram не может быть пустым.')
             return
@@ -2227,7 +2251,7 @@ class Window(QMainWindow):
             return
         self.import_status.setText('Обновляю профиль в Telegram...')
         thread=QThread(self)
-        worker=Worker(lambda:self.update_account_profile(account_id,session,selected_photo,first_name_text,last_name_text,should_update_name,username_text,should_update_username,about_text,should_update_about,api_id,api_hash))
+        worker=Worker(lambda:self.update_account_profile(account_id,session,selected_photo,first_name_text,last_name_text,should_update_name,username_text,should_update_username,about_text,should_update_about,should_delete_old_photos,api_id,api_hash))
         self.profile_edit_thread=thread; self.profile_edit_worker=worker
         worker.moveToThread(thread); thread.started.connect(worker.run)
         worker.done.connect(self.profile_edit_succeeded); worker.error.connect(lambda error:self.profile_edit_failed(error,session),Qt.QueuedConnection)
@@ -2250,9 +2274,9 @@ class Window(QMainWindow):
             line_edit.setText(path)
             self.set_profile_preview(preview,path,'')
 
-    async def update_account_profile(self,account_id,session,photo_path,first_name,last_name,should_update_name,username,should_update_username,about,should_update_about,api_id,api_hash):
+    async def update_account_profile(self,account_id,session,photo_path,first_name,last_name,should_update_name,username,should_update_username,about,should_update_about,should_delete_old_photos,api_id,api_hash):
         from telethon.tl.functions.account import UpdateProfileRequest, UpdateUsernameRequest
-        from telethon.tl.functions.photos import UploadProfilePhotoRequest
+        from telethon.tl.functions.photos import DeletePhotosRequest, UploadProfilePhotoRequest
         client_options=await prepare_telegram_client()
         client=create_account_client(session,api_id,api_hash,**client_options)
         updated=[]
@@ -2264,6 +2288,18 @@ class Window(QMainWindow):
                     uploaded=await telegram_call(client.upload_file(photo_path),'загрузка новой аватарки',timeout=60)
                     await telegram_call(client(UploadProfilePhotoRequest(file=uploaded)),'обновление аватарки')
                     updated.append('аватарка')
+                if should_delete_old_photos:
+                    photos=await telegram_call(client.get_profile_photos('me'),'получение истории аватарок',timeout=60)
+                    deletion_batches=profile_photo_deletion_batches(photos)
+                    deleted_count=0
+                    for batch in deletion_batches:
+                        deleted=await telegram_call(client(DeletePhotosRequest(id=batch)),'удаление предыдущих аватарок',timeout=60)
+                        deleted_count+=len(deleted)
+                        if updated and updated[-1].startswith('удалено предыдущих аватарок:'):
+                            updated.pop()
+                        updated.append(f'удалено предыдущих аватарок: {deleted_count}')
+                    if not deletion_batches:
+                        updated.append('предыдущих аватарок не найдено')
                 if should_update_name or should_update_about:
                     await telegram_call(client(UpdateProfileRequest(
                         first_name=first_name if should_update_name else None,
