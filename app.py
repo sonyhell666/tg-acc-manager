@@ -2,7 +2,7 @@ from __future__ import annotations
 import asyncio, base64, hashlib, html, json, os, re, shutil, socket, sqlite3, subprocess, sys, tempfile, time, zipfile
 import urllib.error, urllib.request
 from pathlib import Path
-from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QThread, Signal, Qt, QTimer, QUrl, QEvent
 from PySide6.QtGui import QColor, QIcon, QPainter, QPainterPath, QPixmap, QTextCursor
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -37,11 +37,12 @@ def database():
     for column in ('telegram_id INTEGER','first_name TEXT NOT NULL DEFAULT \'\'','last_name TEXT NOT NULL DEFAULT \'\'','username TEXT NOT NULL DEFAULT \'\'','avatar TEXT NOT NULL DEFAULT \'\'','about TEXT NOT NULL DEFAULT \'\''):
         name=column.split()[0]
         if name not in columns: c.execute(f'ALTER TABLE accounts ADD COLUMN {column}')
-    c.execute('CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY,title TEXT,peer TEXT UNIQUE NOT NULL,join_peer TEXT NOT NULL DEFAULT \'\',assigned_session TEXT NOT NULL DEFAULT \'\')')
+    c.execute('CREATE TABLE IF NOT EXISTS chats(id INTEGER PRIMARY KEY,title TEXT,peer TEXT UNIQUE NOT NULL,join_peer TEXT NOT NULL DEFAULT \'\',assigned_session TEXT NOT NULL DEFAULT \'\',is_pinned INTEGER NOT NULL DEFAULT 0)')
     chat_columns={row[1] for row in c.execute('PRAGMA table_info(chats)')}
     if 'join_peer' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN join_peer TEXT NOT NULL DEFAULT \'\'')
     if 'assigned_session' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN assigned_session TEXT NOT NULL DEFAULT \'\'')
     if 'chat_type' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN chat_type TEXT NOT NULL DEFAULT \'\'')
+    if 'is_pinned' not in chat_columns: c.execute('ALTER TABLE chats ADD COLUMN is_pinned INTEGER NOT NULL DEFAULT 0')
     c.commit(); return c
 
 def telegram_mark_icon(size=24):
@@ -173,6 +174,24 @@ def normalize_proxy_url(proxy_url):
         raise ValueError('Формат прокси: IP:порт:логин:пароль; проверьте адрес, порт, логин и пароль.')
     return f'socks5://{quote(username,safe="")}:{quote(password,safe="")}@{host}:{int(port)}'
 
+def configured_proxy_settings():
+    try:
+        settings=json.loads(SETTINGS.read_text(encoding='utf-8')) if SETTINGS.exists() else {}
+    except (OSError,json.JSONDecodeError) as error:
+        raise RuntimeError(f'Не удалось прочитать настройки подключения: {error}') from error
+    proxy_url=(os.environ.get('TG_PROXY','') or settings.get('proxy','')).strip()
+    environment_mode=os.environ.get('TG_PROXY_MODE','').strip()
+    saved_mode=settings.get('proxy_mode','')
+    if environment_mode in ('local','none','custom'):
+        mode=environment_mode
+    elif saved_mode in ('local','none','custom'):
+        mode=saved_mode
+    elif proxy_url:
+        mode='custom'
+    else:
+        mode='local' if TGWS_PROXY_EXE.is_file() else 'none'
+    return mode,proxy_url
+
 def telegram_proxy(proxy_url=None):
     raw=(os.environ.get('TG_PROXY','') if proxy_url is None else proxy_url).strip()
     if not raw: return None
@@ -212,12 +231,18 @@ def tgws_proxy_config():
         raise RuntimeError('В конфигурации TgWsProxy отсутствуют корректные host, port или secret.')
     return host,port,secret
 
-def telegram_client_options(proxy_url=None):
-    raw=(os.environ.get('TG_PROXY','') if proxy_url is None else proxy_url).strip()
-    if raw:
-        return {'proxy':telegram_proxy(raw)}
-    if not TGWS_PROXY_EXE.is_file():
+def telegram_client_options(proxy_url=None,proxy_mode=None):
+    configured_mode,configured_url=configured_proxy_settings()
+    mode=proxy_mode or configured_mode
+    if mode not in ('local','none','custom'):
+        raise ValueError('Выберите способ подключения: локальный прокси, без прокси или пользовательский прокси.')
+    raw=(proxy_url if proxy_url is not None else configured_url).strip()
+    if mode=='none':
         return {}
+    if mode=='custom':
+        if not raw:
+            raise ValueError('Введите адрес пользовательского прокси.')
+        return {'proxy':telegram_proxy(raw)}
     host,port,secret=tgws_proxy_config()
     return {
         'connection':ConnectionTcpMTProxyRandomizedIntermediate,
@@ -262,9 +287,10 @@ def ensure_tgws_proxy():
     raise TimeoutError(f'TgWsProxy не открыл локальный порт {host}:{port} за 10 секунд.')
 
 async def prepare_telegram_client():
-    if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file():
+    mode,_=configured_proxy_settings()
+    if mode=='local':
         await asyncio.to_thread(ensure_tgws_proxy)
-    return telegram_client_options()
+    return telegram_client_options(proxy_mode=mode)
 
 class Worker(QObject):
     done=Signal(object); error=Signal(str); progress=Signal(str); item=Signal(object)
@@ -798,7 +824,7 @@ class Window(QMainWindow):
         w=QWidget(); l=QVBoxLayout(w); l.setContentsMargins(0,0,0,18)
         a=QLabel(title); a.setObjectName('title'); b=QLabel(subtitle); b.setObjectName('muted'); l.addWidget(a); l.addWidget(b); return w
     def make_table(self,headers):
-        t=QTableWidget(0,len(headers)); t.setHorizontalHeaderLabels(headers); t.verticalHeader().hide(); t.setSelectionBehavior(QTableWidget.SelectRows); t.setAlternatingRowColors(True); t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); return t
+        t=QTableWidget(0,len(headers)); t.setHorizontalHeaderLabels(headers); t.verticalHeader().hide(); t.setSelectionBehavior(QTableWidget.SelectRows); t.setEditTriggers(QAbstractItemView.NoEditTriggers); t.setAlternatingRowColors(True); t.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); return t
     def create_metric(self,label):
         f=QFrame(); f.setObjectName('card'); l=QVBoxLayout(f); a=QLabel(label.upper()); a.setObjectName('muted'); v=QLabel('0'); v.setObjectName('metric'); l.addWidget(a); l.addWidget(v); return f
     def update_application(self):
@@ -962,6 +988,8 @@ class Window(QMainWindow):
         save_default=QPushButton('Сохранить сообщение по умолчанию'); save_default.clicked.connect(self.save_default_message); default_layout.addWidget(save_default,0,Qt.AlignRight)
         l.addWidget(default_box)
         self.chat_table=self.make_table(['Название','Идентификатор','Тип','Аккаунт отправки','Действие'])
+        self.chat_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.chat_table.customContextMenuRequested.connect(self.show_chat_context_menu)
         l.addWidget(self.chat_table); return w
 
     def send_page(self):
@@ -1133,7 +1161,7 @@ class Window(QMainWindow):
         content.addWidget(self.dialog_list); content.addLayout(conversation,1); layout.addLayout(content,1); return w
     def refresh(self):
         selected_session=self.account_box.currentData()
-        accounts=list(self.conn.execute('SELECT id,name,session,first_name,last_name,username,avatar,account_status FROM accounts ORDER BY name')); chats=list(self.conn.execute('SELECT id,title,peer,assigned_session,chat_type FROM chats ORDER BY title'))
+        accounts=list(self.conn.execute('SELECT id,name,session,first_name,last_name,username,avatar,account_status FROM accounts ORDER BY name')); chats=list(self.conn.execute('SELECT id,title,peer,assigned_session,chat_type,is_pinned FROM chats ORDER BY is_pinned DESC,title COLLATE NOCASE'))
         self.account_table.setRowCount(0); self.chat_table.setRowCount(0); self.account_box.clear(); self.chat_box.clear(); self.account_unread_badges={}
         for account_id,name,session,first_name,last_name,username,avatar,account_status in accounts:
             r=self.account_table.rowCount(); self.account_table.insertRow(r)
@@ -1176,9 +1204,14 @@ class Window(QMainWindow):
             label=f'{display_name} (@{username})' if username and display_name != f'@{username}' else display_name
             self.account_box.addItem(label,session)
             if selected_session == session: self.account_box.setCurrentIndex(self.account_box.count()-1)
-        for chat_id,title,peer,assigned_session,chat_type in chats:
+        for chat_id,title,peer,assigned_session,chat_type,is_pinned in chats:
             r=self.chat_table.rowCount(); self.chat_table.insertRow(r); typ=chat_type or ('ID' if peer.lstrip('-').isdigit() else 'Username/ссылка')
-            for i,x in enumerate((title,peer,typ)): self.chat_table.setItem(r,i,QTableWidgetItem(x))
+            title_item=QTableWidgetItem(f'📌 {title}' if is_pinned else title)
+            title_item.setData(Qt.UserRole,chat_id)
+            if is_pinned: title_item.setToolTip('Этот чат закреплён и отображается сверху.')
+            self.chat_table.setItem(r,0,title_item)
+            self.chat_table.setItem(r,1,QTableWidgetItem(peer))
+            self.chat_table.setItem(r,2,QTableWidgetItem(typ))
             account_select=QComboBox(); account_select.addItem('— Выберите аккаунт —','')
             for _,name,session,first_name,last_name,username,_,_ in accounts:
                 display_name=' '.join(part for part in (first_name,last_name) if part).strip() or (f'@{username}' if username else name)
@@ -1187,13 +1220,77 @@ class Window(QMainWindow):
             assigned_index=account_select.findData(assigned_session)
             account_select.setCurrentIndex(assigned_index if assigned_index>=0 else 0)
             account_select.currentIndexChanged.connect(lambda _,ident=chat_id,selector=account_select:self.assign_chat_account(ident,selector.currentData()))
+            account_select.installEventFilter(self)
             self.chat_table.setCellWidget(r,3,account_select)
             send_button=QPushButton('➤ Отправить')
             send_button.clicked.connect(lambda _,ident=chat_id,chat_peer=peer,selector=account_select,button=send_button:self.send_default_to_chat(ident,chat_peer,selector.currentData(),button))
+            send_button.installEventFilter(self)
             self.chat_table.setCellWidget(r,4,send_button)
             self.chat_table.setRowHeight(r,48)
             self.chat_box.addItem(f'{title}  ·  {peer}',peer)
         self.accounts_metric.findChild(QLabel,'metric').setText(str(len(accounts))); self.chats_metric.findChild(QLabel,'metric').setText(str(len(chats)))
+
+    def eventFilter(self,watched,event):
+        if event.type()==QEvent.ContextMenu and self.chat_table is not None:
+            position=self.chat_table.viewport().mapFromGlobal(event.globalPos())
+            QTimer.singleShot(0,lambda point=position:self.show_chat_context_menu(point))
+            return True
+        return super().eventFilter(watched,event)
+
+    def show_chat_context_menu(self,position):
+        row=self.chat_table.rowAt(position.y())
+        if row<0: return
+        item=self.chat_table.item(row,0)
+        if item is None: return
+        chat_id=item.data(Qt.UserRole)
+        chat=self.conn.execute('SELECT title,peer,is_pinned FROM chats WHERE id=?',(chat_id,)).fetchone()
+        if not chat: return
+        title,peer,is_pinned=chat
+        menu=QMenu(self)
+        pin_action=menu.addAction('Открепить чат' if is_pinned else 'Закрепить чат сверху')
+        copy_title_action=menu.addAction('Копировать название')
+        copy_peer_action=menu.addAction('Копировать идентификатор')
+        menu.addSeparator()
+        delete_action=menu.addAction('Удалить чат')
+        chosen=menu.exec(self.chat_table.viewport().mapToGlobal(position))
+        if chosen==pin_action:
+            self.set_chat_pinned(chat_id,not bool(is_pinned))
+        elif chosen==copy_title_action:
+            QApplication.clipboard().setText(title)
+            self.chat_status.setText('Название чата скопировано.')
+        elif chosen==copy_peer_action:
+            QApplication.clipboard().setText(peer)
+            self.chat_status.setText('Идентификатор чата скопирован.')
+        elif chosen==delete_action:
+            self.delete_chat(chat_id,title)
+
+    def set_chat_pinned(self,chat_id,is_pinned):
+        try:
+            self.conn.execute('UPDATE chats SET is_pinned=? WHERE id=?',(int(is_pinned),chat_id))
+            self.conn.commit()
+        except sqlite3.Error as error:
+            QMessageBox.critical(self,'Закрепление чата',f'Не удалось сохранить настройку закрепления: {error}')
+            return
+        self.refresh()
+        self.chat_status.setText('Чат закреплён сверху.' if is_pinned else 'Чат откреплён.')
+
+    def delete_chat(self,chat_id,title):
+        answer=QMessageBox.question(
+            self,
+            'Удалить чат из списка',
+            f'Удалить «{title}» из списка чатов? Это не удалит чат в Telegram.',
+            QMessageBox.Yes|QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer!=QMessageBox.Yes: return
+        try:
+            self.conn.execute('DELETE FROM chats WHERE id=?',(chat_id,))
+            self.conn.commit()
+        except sqlite3.Error as error:
+            QMessageBox.critical(self,'Удаление чата',f'Не удалось удалить чат из списка: {error}')
+            return
+        self.refresh()
+        self.chat_status.setText(f'Чат «{title}» удалён из списка программы.')
     def save_default_message(self):
         try:
             settings=json.loads(SETTINGS.read_text(encoding='utf-8')) if SETTINGS.exists() else {}
@@ -1221,21 +1318,34 @@ class Window(QMainWindow):
             QMessageBox.critical(self,'Настройки',f'Не удалось прочитать data/settings.json: {error}')
             return
         current=(os.environ.get('TG_PROXY') or settings.get('proxy','')).strip()
+        try: current_mode,_=configured_proxy_settings()
+        except RuntimeError as error:
+            QMessageBox.critical(self,'Настройки',str(error))
+            return
         dialog=QDialog(self); dialog.setWindowTitle('Подключение Telegram'); form=QFormLayout(dialog)
         api_id_input=QLineEdit(str(settings.get('api_id',os.environ.get('TG_API_ID',''))))
         api_hash_input=QLineEdit(str(settings.get('api_hash',os.environ.get('TG_API_HASH',''))))
         api_hash_input.setEchoMode(QLineEdit.Password)
         form.addRow('API ID',api_id_input)
         form.addRow('API Hash',api_hash_input)
+        proxy_mode_box=QComboBox()
+        proxy_mode_box.addItem('Без прокси','none')
+        proxy_mode_box.addItem('Локальный TgWsProxy','local')
+        proxy_mode_box.addItem('Пользовательский прокси','custom')
+        mode_index=proxy_mode_box.findData(current_mode)
+        proxy_mode_box.setCurrentIndex(mode_index if mode_index>=0 else 0)
+        form.addRow('Способ подключения',proxy_mode_box)
         proxy_input=QLineEdit(current)
         proxy_input.setPlaceholderText('IP:порт, IP:порт:логин:пароль или http://host:port')
         form.addRow('Прокси одной строкой',proxy_input)
-        form.addRow(QLabel('Оставьте поле пустым, чтобы использовать TgWsProxy_windows.exe. Также поддерживаются IP:порт, IP:порт:логин:пароль и proxy URL.'))
-        proxy_status=QLabel('Нажмите «Проверить», чтобы проверить текущий прокси. Пустое поле использует TgWsProxy по умолчанию.')
+        proxy_mode_box.currentIndexChanged.connect(lambda _:proxy_input.setEnabled(proxy_mode_box.currentData()=='custom'))
+        proxy_input.setEnabled(current_mode=='custom')
+        form.addRow(QLabel('Для прямого соединения выберите «Без прокси». Локальный режим требует установленный TgWsProxy. Пользовательский режим поддерживает IP:порт, IP:порт:логин:пароль и proxy URL.'))
+        proxy_status=QLabel('Нажмите «Проверить», чтобы проверить выбранный способ подключения.')
         form.addRow(proxy_status)
         buttons=QDialogButtonBox(QDialogButtonBox.Save|QDialogButtonBox.Cancel); buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject); form.addRow(buttons)
         test_button=buttons.addButton('Проверить',QDialogButtonBox.ActionRole)
-        test_button.clicked.connect(lambda:self.test_proxy_in_dialog(proxy_input,proxy_status))
+        test_button.clicked.connect(lambda:self.test_proxy_in_dialog(proxy_mode_box,proxy_input,proxy_status))
         if dialog.exec() != QDialog.Accepted: return
         api_id_text=api_id_input.text().strip()
         api_hash=api_hash_input.text().strip()
@@ -1247,59 +1357,63 @@ class Window(QMainWindow):
         if api_id <= 0 or not api_hash:
             QMessageBox.warning(self,'Настройки Telegram','Введите положительный API ID и API Hash.')
             return
+        proxy_mode=proxy_mode_box.currentData()
         try:
-            proxy_url=normalize_proxy_url(proxy_input.text())
-            telegram_client_options(proxy_url)
+            proxy_url=normalize_proxy_url(proxy_input.text()) if proxy_mode=='custom' else ''
+            telegram_client_options(proxy_url,proxy_mode)
         except (ValueError,RuntimeError) as error:
             QMessageBox.warning(self,'Настройки Telegram',str(error))
             return
         settings['api_id']=api_id_text
         settings['api_hash']=api_hash
         settings['proxy']=proxy_url
+        settings['proxy_mode']=proxy_mode
         try: SETTINGS.write_text(json.dumps(settings,ensure_ascii=False,indent=2),encoding='utf-8')
         except OSError as error:
             QMessageBox.critical(self,'Настройки',f'Не удалось сохранить data/settings.json: {error}')
             return
         os.environ['TG_API_ID']=api_id_text
         os.environ['TG_API_HASH']=api_hash
+        os.environ['TG_PROXY_MODE']=proxy_mode
         if proxy_url: os.environ['TG_PROXY']=proxy_url
         else: os.environ.pop('TG_PROXY',None)
-        self.status.setText('Настройки подключения сохранены')
+        self.status.setText('Настройки подключения сохранены: '+('без прокси' if proxy_mode=='none' else 'локальный прокси' if proxy_mode=='local' else 'пользовательский прокси'))
         if self.conn.execute('SELECT 1 FROM accounts LIMIT 1').fetchone(): self.refresh_profiles()
 
-    def test_proxy_in_dialog(self,proxy_input,status):
+    def test_proxy_in_dialog(self,proxy_mode_box,proxy_input,status):
         if self.proxy_test_thread and self.proxy_test_thread.isRunning():
             status.setText('Проверка уже выполняется. Подождите завершения.')
             status.setStyleSheet('color:#e6b450')
             return
+        proxy_mode=proxy_mode_box.currentData()
         try:
             api_id,api_hash=credentials()
-            proxy_url=normalize_proxy_url(proxy_input.text())
-            client_options=telegram_client_options(proxy_url)
+            proxy_url=normalize_proxy_url(proxy_input.text()) if proxy_mode=='custom' else ''
+            client_options=telegram_client_options(proxy_url,proxy_mode)
         except (RuntimeError,ValueError) as error:
             status.setText(f'Некорректные настройки: {error}')
             status.setStyleSheet('color:#ff7777')
             return
-        status.setText('Запускаю локальный прокси и проверяю соединение с Telegram...' if not proxy_url else 'Проверяю соединение с Telegram через указанный прокси...')
+        status.setText('Запускаю локальный прокси и проверяю Telegram...' if proxy_mode=='local' else 'Проверяю прямое соединение с Telegram...' if proxy_mode=='none' else 'Проверяю подключение через указанный прокси...')
         status.setStyleSheet('color:#e6b450')
         thread=QThread(self)
-        worker=Worker(lambda:self.check_telegram_connection(api_id,api_hash,client_options,not proxy_url))
+        worker=Worker(lambda:self.check_telegram_connection(api_id,api_hash,client_options,proxy_mode))
         self.proxy_test_thread=thread
         self.proxy_test_worker=worker
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        success_message='Подключение к Telegram через TgWsProxy работает.' if not proxy_url else 'Подключение к Telegram через этот прокси работает.'
-        worker.done.connect(lambda _:self.proxy_test_finished(status,True,success_message))
-        worker.error.connect(lambda error:self.proxy_test_finished(status,False,error))
+        success_message='Прямое подключение к Telegram работает.' if proxy_mode=='none' else 'Подключение к Telegram через TgWsProxy работает.' if proxy_mode=='local' else 'Подключение к Telegram через этот прокси работает.'
+        worker.done.connect(lambda _:self.proxy_test_finished(status,True,success_message,proxy_mode))
+        worker.error.connect(lambda error:self.proxy_test_finished(status,False,error,proxy_mode))
         worker.done.connect(thread.quit)
         worker.error.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda:self.proxy_test_thread_stopped(thread))
         thread.start()
 
-    async def check_telegram_connection(self,api_id,api_hash,client_options,uses_default_proxy):
+    async def check_telegram_connection(self,api_id,api_hash,client_options,proxy_mode):
         from telethon.sessions import StringSession
-        if uses_default_proxy:
+        if proxy_mode=='local':
             try:
                 await asyncio.wait_for(asyncio.to_thread(ensure_tgws_proxy),timeout=12)
             except asyncio.TimeoutError as error:
@@ -1309,7 +1423,7 @@ class Window(QMainWindow):
             try:
                 await asyncio.wait_for(client.connect(),timeout=15)
             except asyncio.TimeoutError as error:
-                raise TimeoutError('Прокси не завершил подключение к Telegram за 15 секунд.') from error
+                raise TimeoutError('Выбранный способ подключения не завершил соединение с Telegram за 15 секунд.') from error
             if not client.is_connected():
                 raise ConnectionError('Telegram не подтвердил подключение.')
             return True
@@ -1319,14 +1433,14 @@ class Window(QMainWindow):
             except asyncio.TimeoutError:
                 pass
 
-    def proxy_test_finished(self,status,success,message):
+    def proxy_test_finished(self,status,success,message,proxy_mode):
         if success:
             status.setText(message)
             status.setStyleSheet('color:#6fce8b')
         else:
             if 'Connection to Telegram failed' in message:
-                message='Не удалось подключиться к Telegram. Проверьте адрес, порт, логин и пароль прокси.'
-            status.setText(f'Прокси не работает: {message}')
+                message='Не удалось подключиться к Telegram. Проверьте Интернет.' if proxy_mode=='none' else 'Не удалось подключиться к Telegram. Проверьте наличие локального прокси и его конфигурацию.' if proxy_mode=='local' else 'Не удалось подключиться к Telegram. Проверьте адрес, порт, логин и пароль прокси.'
+            status.setText(f'Ошибка подключения: {message}')
             status.setStyleSheet('color:#ff7777')
 
     def proxy_test_thread_stopped(self,thread):
@@ -1466,7 +1580,7 @@ class Window(QMainWindow):
 
     async def load_profiles(self,accounts,api_id,api_hash,client_options,progress=None):
         results=[]
-        if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file(): await asyncio.to_thread(ensure_tgws_proxy)
+        if configured_proxy_settings()[0]=='local': await asyncio.to_thread(ensure_tgws_proxy)
         for index,(account_id,session_path) in enumerate(accounts,1):
             if progress: progress(f'Проверяю аккаунт {index}/{len(accounts)}: подключаюсь к Telegram...')
             client=None
@@ -1701,8 +1815,7 @@ class Window(QMainWindow):
     async def fetch_private_unread_counts(self,sessions,api_id,api_hash):
         from telethon.tl.types import User
         results={}; account_issues=[]
-        if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file(): await asyncio.to_thread(ensure_tgws_proxy)
-        options=telegram_client_options()
+        options=await prepare_telegram_client()
         for session in sessions:
             client=TelegramClient(session,api_id,api_hash,**options)
             try:
