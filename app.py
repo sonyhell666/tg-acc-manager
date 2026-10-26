@@ -138,14 +138,14 @@ def account_issue_from_error(error):
 
 async def telegram_profile_snapshot(client,user):
     from telethon.tl.functions.users import GetFullUserRequest
-    full=await client(GetFullUserRequest(user))
+    full=await telegram_call(client(GetFullUserRequest(user)),'получение данных профиля',timeout=20)
     AVATARS.mkdir(parents=True,exist_ok=True)
     avatar_path=AVATARS/f'{user.id}.jpg'
     avatar=''
     if user.photo:
         temp_path=AVATARS/f'.{user.id}.{time.time_ns()}.jpg'
         try:
-            downloaded=await client.download_profile_photo(user,file=str(temp_path))
+            downloaded=await telegram_call(client.download_profile_photo(user,file=str(temp_path)),'загрузка фото профиля',timeout=30)
             if downloaded and Path(downloaded).is_file():
                 os.replace(downloaded,avatar_path)
                 avatar=str(avatar_path)
@@ -301,6 +301,21 @@ async def connect_account_client(client,timeout=20):
     if not authorized:
         raise RuntimeError('Сессия аккаунта не авторизована. Повторно импортируйте TDATA этого аккаунта.')
 
+async def telegram_call(awaitable,action,timeout=30):
+    try:
+        return await asyncio.wait_for(awaitable,timeout=timeout)
+    except asyncio.TimeoutError as error:
+        raise TimeoutError(f'Не удалось выполнить действие «{action}» за {timeout} секунд. Проверьте подключение к Telegram и повторите попытку.') from error
+
+async def disconnect_account_client(client):
+    await telegram_call(client.disconnect(),'закрытие соединения с Telegram',timeout=5)
+
+def visible_error_message(error):
+    if isinstance(error,str):
+        return error.strip() or 'Операция завершилась ошибкой без описания. Повторите попытку и проверьте журнал приложения.'
+    detail=str(error).strip() or repr(error).strip() or 'ошибка без дополнительного описания'
+    return f'{type(error).__name__}: {detail}'
+
 def create_account_client(session,api_id,api_hash,**options):
     client_options={'timeout':12,'connection_retries':1,'request_retries':1,'retry_delay':1}
     client_options.update(options)
@@ -310,8 +325,24 @@ class Worker(QObject):
     done=Signal(object); error=Signal(str); progress=Signal(str); item=Signal(object)
     def __init__(self,fn,with_progress=False): super().__init__(); self.fn=fn; self.with_progress=with_progress
     def run(self):
-        try: self.done.emit(asyncio.run(self.fn(self.progress.emit,self.item.emit) if self.with_progress else self.fn()))
-        except Exception as e: self.error.emit(f'{type(e).__name__}: {e}')
+        loop=None
+        try:
+            operation=self.fn(self.progress.emit,self.item.emit) if self.with_progress else self.fn()
+            loop=asyncio.SelectorEventLoop() if sys.platform=='win32' else asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            result=loop.run_until_complete(operation)
+            self.done.emit(result)
+        except Exception as error:
+            message=visible_error_message(error)
+            write_import_log(f'Ошибка фоновой операции: {message}')
+            self.error.emit(message)
+        finally:
+            if loop is not None:
+                try:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                finally:
+                    loop.close()
+                    asyncio.set_event_loop(None)
 
 class ImportWorker(QObject):
     done=Signal(object); error=Signal(str)
@@ -1021,8 +1052,8 @@ class Window(QMainWindow):
         worker.moveToThread(thread); thread.started.connect(worker.run)
         worker.progress.connect(self.dialog_status.setText)
         session=self.dialog_account_box.currentData()
-        worker.done.connect(completed); worker.error.connect(lambda error:self.dialog_operation_failed(error,session))
-        worker.done.connect(thread.quit); worker.error.connect(thread.quit)
+        worker.done.connect(completed); worker.error.connect(lambda error:self.dialog_operation_failed(error,session),Qt.QueuedConnection)
+        worker.done.connect(thread.quit,Qt.DirectConnection); worker.error.connect(thread.quit,Qt.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda finished=thread:self.dialog_thread_finished(finished))
         thread.start()
@@ -1072,7 +1103,7 @@ class Window(QMainWindow):
                 if len(results)%25==0: progress(f'Загружено диалогов: {len(results)}...')
             return results
         finally:
-            await client.disconnect()
+            await disconnect_account_client(client)
 
     def dialogs_loaded(self,dialogs):
         self.dialog_list.clear()
@@ -1104,8 +1135,8 @@ class Window(QMainWindow):
         try:
             progress('Подключаюсь к Telegram и загружаю историю...')
             await connect_account_client(client)
-            entity=await client.get_entity(int(peer))
-            messages=await client.get_messages(entity,limit=100)
+            entity=await telegram_call(client.get_entity(int(peer)),'поиск диалога')
+            messages=await telegram_call(client.get_messages(entity,limit=100),'загрузка истории сообщений')
             lines=[]
             for message in reversed(messages):
                 date=message.date.astimezone().strftime('%Y-%m-%d %H:%M') if message.date else ''
@@ -1114,7 +1145,7 @@ class Window(QMainWindow):
                 lines.append(f'[{date}] {sender}:\n{text}')
             return '\n\n'.join(lines) or 'В этом диалоге пока нет сообщений.'
         finally:
-            await client.disconnect()
+            await disconnect_account_client(client)
 
     def dialog_messages_loaded(self,text):
         self.dialog_history.setPlainText(text)
@@ -1143,9 +1174,9 @@ class Window(QMainWindow):
         try:
             progress('Подключаюсь к Telegram и отправляю сообщение...')
             await connect_account_client(client)
-            entity=await client.get_entity(int(peer))
-            await client.send_message(entity,text)
-            messages=await client.get_messages(entity,limit=100)
+            entity=await telegram_call(client.get_entity(int(peer)),'поиск диалога')
+            await telegram_call(client.send_message(entity,text),'отправка сообщения')
+            messages=await telegram_call(client.get_messages(entity,limit=100),'обновление истории сообщений')
             lines=[]
             for message in reversed(messages):
                 date=message.date.astimezone().strftime('%Y-%m-%d %H:%M') if message.date else ''
@@ -1154,7 +1185,7 @@ class Window(QMainWindow):
                 lines.append(f'[{date}] {sender}:\n{body}')
             return '\n\n'.join(lines) or 'Сообщение отправлено.'
         finally:
-            await client.disconnect()
+            await disconnect_account_client(client)
 
     def dialog_message_sent(self,text):
         self.dialog_compose.clear(); self.dialog_history.setPlainText(text)
@@ -1418,8 +1449,8 @@ class Window(QMainWindow):
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         success_message='Прямое подключение к Telegram работает.' if proxy_mode=='none' else 'Подключение к Telegram через TgWsProxy работает.' if proxy_mode=='local' else 'Подключение к Telegram через этот прокси работает.'
-        worker.done.connect(lambda _:self.proxy_test_finished(status,True,success_message,proxy_mode))
-        worker.error.connect(lambda error:self.proxy_test_finished(status,False,error,proxy_mode))
+        worker.done.connect(lambda _:self.proxy_test_finished(status,True,success_message,proxy_mode),Qt.QueuedConnection)
+        worker.error.connect(lambda error:self.proxy_test_finished(status,False,error,proxy_mode),Qt.QueuedConnection)
         worker.done.connect(thread.quit)
         worker.error.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
@@ -1577,10 +1608,10 @@ class Window(QMainWindow):
         self.profile_worker.moveToThread(self.profile_thread)
         self.profile_thread.started.connect(self.profile_worker.run)
         self.profile_worker.progress.connect(self.import_status.setText)
-        self.profile_worker.done.connect(lambda results,display_errors=show_errors:self.profiles_loaded(results,display_errors))
-        self.profile_worker.error.connect(lambda error,display_errors=show_errors:self.profile_load_failed(error,display_errors))
-        self.profile_worker.done.connect(self.profile_thread.quit)
-        self.profile_worker.error.connect(self.profile_thread.quit)
+        self.profile_worker.done.connect(lambda results,display_errors=show_errors:self.profiles_loaded(results,display_errors),Qt.QueuedConnection)
+        self.profile_worker.error.connect(lambda error,display_errors=show_errors:self.profile_load_failed(error,display_errors),Qt.QueuedConnection)
+        self.profile_worker.done.connect(self.profile_thread.quit,Qt.DirectConnection)
+        self.profile_worker.error.connect(self.profile_thread.quit,Qt.DirectConnection)
         self.profile_thread.finished.connect(self.profile_worker.deleteLater)
         self.profile_thread.finished.connect(lambda thread=self.profile_thread:self.profile_thread_finished(thread))
         self.profile_thread.start()
@@ -1935,8 +1966,8 @@ class Window(QMainWindow):
         worker=Worker(lambda:self.update_account_profile(account_id,session,selected_photo,first_name_text,last_name_text,should_update_name,username_text,should_update_username,about_text,should_update_about,api_id,api_hash))
         self.profile_edit_thread=thread; self.profile_edit_worker=worker
         worker.moveToThread(thread); thread.started.connect(worker.run)
-        worker.done.connect(self.profile_edit_succeeded); worker.error.connect(lambda error:self.profile_edit_failed(error,session))
-        worker.done.connect(thread.quit); worker.error.connect(thread.quit)
+        worker.done.connect(self.profile_edit_succeeded); worker.error.connect(lambda error:self.profile_edit_failed(error,session),Qt.QueuedConnection)
+        worker.done.connect(thread.quit,Qt.DirectConnection); worker.error.connect(thread.quit,Qt.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda finished=thread:self.profile_edit_thread_finished(finished))
         thread.start()
@@ -1965,21 +1996,21 @@ class Window(QMainWindow):
             await connect_account_client(client)
             try:
                 if photo_path:
-                    uploaded=await client.upload_file(photo_path)
-                    await client(UploadProfilePhotoRequest(file=uploaded))
+                    uploaded=await telegram_call(client.upload_file(photo_path),'загрузка новой аватарки',timeout=60)
+                    await telegram_call(client(UploadProfilePhotoRequest(file=uploaded)),'обновление аватарки')
                     updated.append('аватарка')
                 if should_update_name or should_update_about:
-                    await client(UpdateProfileRequest(
+                    await telegram_call(client(UpdateProfileRequest(
                         first_name=first_name if should_update_name else None,
                         last_name=last_name if should_update_name else None,
                         about=about if should_update_about else None,
-                    ))
+                    )),'обновление имени и описания')
                 if should_update_name:
                     updated.append('имя профиля Telegram')
                 if should_update_about:
                     updated.append('описание')
                 if should_update_username:
-                    await client(UpdateUsernameRequest(username=username))
+                    await telegram_call(client(UpdateUsernameRequest(username=username)),'обновление username')
                     updated.append('username')
             except Exception as error:
                 from telethon.errors import UsernameInvalidError, UsernameOccupiedError
@@ -1995,12 +2026,12 @@ class Window(QMainWindow):
                     raise RuntimeError(f'Частичное обновление: {completed} обновлено, остальные изменения не применены. {detail}') from error
                 if error_message: raise RuntimeError(error_message) from error
                 raise
-            user=await client.get_me()
+            user=await telegram_call(client.get_me(),'получение обновлённого профиля')
             if user is None: raise RuntimeError('Telegram не вернул данные обновлённого профиля.')
             first_name,last_name,username,avatar,updated_about=await telegram_profile_snapshot(client,user)
             return account_id,user.id,first_name,last_name,username,avatar,updated_about,updated
         finally:
-            await client.disconnect()
+            await disconnect_account_client(client)
 
     def profile_edit_succeeded(self,result):
         account_id,telegram_id,first_name,last_name,username,avatar,about,updated=result
@@ -2012,6 +2043,7 @@ class Window(QMainWindow):
         QMessageBox.information(self,'Профиль Telegram',self.import_status.text())
 
     def profile_edit_failed(self,error,session=''):
+        error=visible_error_message(error)
         self.mark_account_issue(session,error)
         self.import_status.setText(f'Не удалось изменить профиль: {error}')
         self.status.setText('Ошибка изменения профиля')
@@ -2202,7 +2234,7 @@ class Window(QMainWindow):
             return
         self.chat_status.setText(f'Проверяю группу {peer} через Telegram...')
         self.status.setText(f'Проверяю группу {peer} через Telegram...')
-        session=self.account_box.currentData(); self.thread=QThread(); self.worker=Worker(lambda:self.resolve_group(api_id,api_hash,session,peer,join_peer)); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.done.connect(self.group_resolved); self.worker.error.connect(lambda error:self.group_resolution_failed(error,session)); self.thread.start()
+        session=self.account_box.currentData(); self.thread=QThread(); self.worker=Worker(lambda:self.resolve_group(api_id,api_hash,session,peer,join_peer)); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.done.connect(self.group_resolved); self.worker.error.connect(lambda error:self.group_resolution_failed(error,session),Qt.QueuedConnection); self.worker.done.connect(self.thread.quit,Qt.DirectConnection); self.worker.error.connect(self.thread.quit,Qt.DirectConnection); self.thread.start()
     async def resolve_group(self,api_id,api_hash,session,peer,join_peer=''):
         from telethon.tl.types import Chat, Channel
         from telethon.utils import get_peer_id
@@ -2245,7 +2277,7 @@ class Window(QMainWindow):
         self.status.setText('Проверяю чат и отправляю...'); session=self.account_box.currentData(); peer=self.chat_box.currentData(); text=self.message.toPlainText().strip()
         chat_row=self.conn.execute('SELECT join_peer FROM chats WHERE peer=?',(str(peer),)).fetchone()
         join_peer=chat_row[0] if chat_row else ''
-        self.thread=QThread(); self.worker=Worker(lambda:self.do_send(api_id,api_hash,session,peer,text,join_peer)); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.done.connect(self.sent); self.worker.error.connect(lambda error:self.failed(error,session)); self.thread.start()
+        self.thread=QThread(); self.worker=Worker(lambda:self.do_send(api_id,api_hash,session,peer,text,join_peer)); self.worker.moveToThread(self.thread); self.thread.started.connect(self.worker.run); self.worker.done.connect(self.sent); self.worker.error.connect(lambda error:self.failed(error,session),Qt.QueuedConnection); self.worker.done.connect(self.thread.quit,Qt.DirectConnection); self.worker.error.connect(self.thread.quit,Qt.DirectConnection); self.thread.start()
     def send_default_to_chat(self,chat_id,peer,session,button):
         if (self.chat_send_thread and self.chat_send_thread.isRunning()) or (self.thread and self.thread.isRunning()):
             self.chat_status.setText('Дождитесь завершения текущей отправки.')
@@ -2273,9 +2305,9 @@ class Window(QMainWindow):
         worker.moveToThread(thread); thread.started.connect(worker.run)
         button.setEnabled(False); button.setText('Отправка...')
         self.chat_status.setText(f'Отправляю сообщение в «{self.conn.execute("SELECT title FROM chats WHERE id=?",(chat_id,)).fetchone()[0]}»...')
-        worker.done.connect(lambda _:self.chat_default_send_finished(button,None))
-        worker.error.connect(lambda error:self.chat_default_send_finished(button,error,session))
-        worker.done.connect(thread.quit); worker.error.connect(thread.quit)
+        worker.done.connect(lambda _:self.chat_default_send_finished(button,None),Qt.QueuedConnection)
+        worker.error.connect(lambda error:self.chat_default_send_finished(button,error,session),Qt.QueuedConnection)
+        worker.done.connect(thread.quit,Qt.DirectConnection); worker.error.connect(thread.quit,Qt.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda finished=thread:self.chat_send_thread_finished(finished))
         thread.start()
@@ -2320,9 +2352,9 @@ class Window(QMainWindow):
         thread=QThread(self); worker=Worker(lambda:self.do_broadcast(api_id,api_hash,text,recipients))
         self.chat_send_thread=thread; self.chat_send_worker=worker
         worker.moveToThread(thread); thread.started.connect(worker.run)
-        worker.done.connect(lambda result:self.chat_broadcast_finished(result,len(recipients)))
+        worker.done.connect(lambda result:self.chat_broadcast_finished(result,len(recipients)),Qt.QueuedConnection)
         worker.error.connect(self.chat_broadcast_failed)
-        worker.done.connect(thread.quit); worker.error.connect(thread.quit)
+        worker.done.connect(thread.quit,Qt.DirectConnection); worker.error.connect(thread.quit,Qt.DirectConnection)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(lambda finished=thread:self.chat_send_thread_finished(finished))
         thread.start()
@@ -2370,6 +2402,7 @@ class Window(QMainWindow):
         thread.deleteLater()
     def sent(self,_): self.status.setText('Сообщение успешно отправлено'); self.message.clear(); self.thread.quit()
     def failed(self,e,session=''):
+        e=visible_error_message(e)
         self.mark_account_issue(session,e)
         message=str(e)
         lower=message.lower()
@@ -2400,28 +2433,28 @@ class Window(QMainWindow):
                 entity=peer_value
             lookup=join_peer or entity
             try:
-                target=await client.get_entity(lookup)
+                target=await telegram_call(client.get_entity(lookup),'поиск чата')
             except ValueError as exc:
                 if not join_peer and isinstance(entity,int):
                     raise RuntimeError('Не удалось найти группу по сохранённому ID для этого аккаунта. Удалите её и добавьте заново по публичному @username, чтобы аккаунт мог вступить перед отправкой.') from exc
                 raise
             if isinstance(target,Channel) and target.megagroup:
                 try:
-                    await client(JoinChannelRequest(target))
+                    await telegram_call(client(JoinChannelRequest(target)),'вступление в группу')
                 except UserAlreadyParticipantError:
                     pass
-                target=await client.get_entity(target)
+                target=await telegram_call(client.get_entity(target),'обновление данных группы')
             elif join_peer:
                 raise RuntimeError('По указанной ссылке найден не публичная группа. Автоматическое вступление доступно для публичных групп по @username; приватные группы требуют invite-ссылку.')
             try:
-                await client.send_message(target,text)
+                await telegram_call(client.send_message(target,text),'отправка сообщения')
             except (ChatWriteForbiddenError,BroadcastForbiddenError,ChannelPrivateError,UserBannedInChannelError) as exc:
                 raise RuntimeError('Нельзя отправлять сообщения в этот чат. Проверьте, что аккаунт состоит в чате и имеет права на отправку сообщений; для каналов это обычно доступно только администратору.') from exc
             except FloodWaitError as exc:
                 raise RuntimeError(f'Telegram временно ограничил отправку сообщений. Подождите {exc.seconds} секунд и попробуйте снова.') from exc
             return True
         finally:
-            await client.disconnect()
+            await disconnect_account_client(client)
 
 STYLE='''QMainWindow,QWidget{background:#10141d;color:#e8edf5;font-family:Segoe UI;font-size:13px}#side{background:#171d29;border-right:1px solid #293244}#brand{color:#64a8ff;font-size:19px;font-weight:700}#nav{background:transparent;border:0}#nav::item{padding:13px;margin:3px 0;color:#9ba8bd;border-radius:7px}#nav::item:selected{background:#263b5c;color:white}QPushButton{background:#263248;border:1px solid #34425a;border-radius:7px;padding:10px 15px;color:#e8edf5}QPushButton:hover{background:#31496d}#primary{background:#347bd1;border:0;font-weight:600}#action{text-align:left;padding:16px}#title{font-size:27px;font-weight:700;color:#f4f7fb}#muted{color:#8390a5}#card,#panel{background:#171e2b;border:1px solid #29364b;border-radius:10px}#card{padding:10px}#metric{font-size:28px;font-weight:700;color:#64a8ff}QTableWidget{background:#171e2b;alternate-background-color:#1b2535;border:1px solid #29364b;border-radius:8px;gridline-color:#29364b}QHeaderView::section{background:#202b3d;color:#aebbd0;padding:10px;border:0}QComboBox,QPlainTextEdit{background:#111823;border:1px solid #34425a;border-radius:6px;padding:9px;color:#e8edf5}QComboBox QAbstractItemView{background:#1b2535}'''
 if __name__=='__main__':
