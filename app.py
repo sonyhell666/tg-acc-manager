@@ -111,7 +111,9 @@ def download_latest_app_update():
 
 def account_issue_from_error(error):
     description=re.sub(r'[^A-Z0-9:]', '', f'{type(error).__name__}: {error}'.upper())
-    if any(marker in description for marker in ('USERDEACTIVATEDBANERROR','USERDEACTIVATEDERROR','PHONENUMBERBANNEDERROR','ACCOUNTBANNEDERROR','ACCOUNTBANNED:')):
+    if 'USERDEACTIVATEDERROR' in description and 'USERDEACTIVATEDBANERROR' not in description:
+        return 'deleted'
+    if any(marker in description for marker in ('USERDEACTIVATEDBANERROR','PHONENUMBERBANNEDERROR','ACCOUNTBANNEDERROR','ACCOUNTBANNED:')):
         return 'banned'
     if any(marker in description for marker in ('PEERFLOODERROR','USERRESTRICTEDERROR','ACCOUNTRESTRICTEDERROR','ACCOUNTRESTRICTED:')):
         return 'restricted'
@@ -1365,7 +1367,7 @@ class Window(QMainWindow):
 
     def refresh_profiles(self,show_errors=True):
         if self.profile_thread and self.profile_thread.isRunning():
-            self.import_status.setText('Загрузка профилей уже выполняется.')
+            self.import_status.setText('Обновление профилей уже выполняется. Дождитесь результата ниже.')
             return
         accounts=list(self.conn.execute('SELECT id,session FROM accounts ORDER BY id'))
         if not accounts:
@@ -1378,9 +1380,10 @@ class Window(QMainWindow):
             return
         self.import_status.setText('Подключаюсь к Telegram и загружаю имена и фото профилей...')
         self.profile_thread=QThread(self)
-        self.profile_worker=Worker(lambda:self.load_profiles(accounts,api_id,api_hash,client_options))
+        self.profile_worker=Worker(lambda progress,item:self.load_profiles(accounts,api_id,api_hash,client_options,progress),with_progress=True)
         self.profile_worker.moveToThread(self.profile_thread)
         self.profile_thread.started.connect(self.profile_worker.run)
+        self.profile_worker.progress.connect(self.import_status.setText)
         self.profile_worker.done.connect(lambda results,display_errors=show_errors:self.profiles_loaded(results,display_errors))
         self.profile_worker.error.connect(lambda error,display_errors=show_errors:self.profile_load_failed(error,display_errors))
         self.profile_worker.done.connect(self.profile_thread.quit)
@@ -1397,24 +1400,42 @@ class Window(QMainWindow):
         if self.import_thread is thread: self.import_thread=None
         thread.deleteLater()
 
-    async def load_profiles(self,accounts,api_id,api_hash,client_options):
+    async def load_profiles(self,accounts,api_id,api_hash,client_options,progress=None):
         results=[]
         if not os.environ.get('TG_PROXY','').strip() and TGWS_PROXY_EXE.is_file(): await asyncio.to_thread(ensure_tgws_proxy)
-        for account_id,session_path in accounts:
-            client=TelegramClient(session_path,api_id,api_hash,**client_options)
+        for index,(account_id,session_path) in enumerate(accounts,1):
+            if progress: progress(f'Проверяю профиль Telegram ({index}/{len(accounts)})...')
+            client=TelegramClient(session_path,api_id,api_hash,timeout=10,connection_retries=1,request_retries=1,retry_delay=1,auto_reconnect=False,**client_options)
+            result=None
             try:
-                await client.start()
-                user=await client.get_me()
+                try:
+                    await asyncio.wait_for(client.connect(),timeout=20)
+                    if not await asyncio.wait_for(client.is_user_authorized(),timeout=15):
+                        raise RuntimeError('Сессия не авторизована. Подключите аккаунт заново через импорт TDATA.')
+                    user=await asyncio.wait_for(client.get_me(),timeout=30)
+                except asyncio.TimeoutError as error:
+                    raise TimeoutError('Telegram не ответил вовремя. Проверьте подключение или прокси и повторите обновление профилей.') from error
                 if user is None: raise RuntimeError('Telegram не вернул данные профиля.')
                 if getattr(user,'deleted',False):
-                    results.append((account_id,user.id,'','','','','','deleted',''))
-                    continue
-                first_name,last_name,username,avatar,about=await telegram_profile_snapshot(client,user)
-                results.append((account_id,user.id,first_name,last_name,username,avatar,about,'',''))
+                    result=(account_id,user.id,'','','','','','deleted','')
+                else:
+                    try:
+                        first_name,last_name,username,avatar,about=await asyncio.wait_for(telegram_profile_snapshot(client,user),timeout=60)
+                    except asyncio.TimeoutError as error:
+                        raise TimeoutError('Telegram не ответил вовремя при загрузке профиля. Проверьте подключение или прокси и повторите обновление профилей.') from error
+                    result=(account_id,user.id,first_name,last_name,username,avatar,about,'','')
             except Exception as error:
-                results.append((account_id,None,'','','','','','',f'{type(error).__name__}: {error}'))
+                if account_issue_from_error(error)=='deleted':
+                    result=(account_id,None,'','','','','','deleted','')
+                else:
+                    result=(account_id,None,'','','','','','',f'{type(error).__name__}: {error}')
             finally:
-                await client.disconnect()
+                try:
+                    await asyncio.wait_for(client.disconnect(),timeout=10)
+                except asyncio.TimeoutError:
+                    if result is None or not result[8]:
+                        result=(account_id,None,'','','','','','', 'Не удалось вовремя закрыть соединение с Telegram.')
+            results.append(result)
         return results
 
     def profiles_loaded(self,results,show_errors=True):
@@ -1431,7 +1452,7 @@ class Window(QMainWindow):
                 account_row=self.conn.execute('SELECT name FROM accounts WHERE id=?',(account_id,)).fetchone()
                 if account_row: deleted_accounts.append(account_row[0])
                 continue
-            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=?,about=? WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
+            self.conn.execute('UPDATE accounts SET telegram_id=?,first_name=?,last_name=?,username=?,avatar=?,about=?,account_status=\'\' WHERE id=?',(telegram_id,first_name,last_name,username,avatar,about,account_id))
         self.conn.commit()
         self.refresh()
         if errors:
@@ -1466,7 +1487,12 @@ class Window(QMainWindow):
         write_import_log(f'Аккаунт {Path(session).name} получил статус {issue} по ответу Telegram: {error}')
         if refresh:
             self.refresh()
-        self.import_status.setText('Telegram сообщил, что аккаунт заблокирован.' if issue=='banned' else 'Telegram ограничил отправку сообщений с этого аккаунта.')
+        messages={
+            'deleted':'Telegram сообщил, что аккаунт удалён.',
+            'banned':'Telegram сообщил, что аккаунт заблокирован.',
+            'restricted':'Telegram ограничил отправку сообщений с этого аккаунта.',
+        }
+        self.import_status.setText(messages[issue])
         return True
 
     def delete_account(self,account_id,session,name):
